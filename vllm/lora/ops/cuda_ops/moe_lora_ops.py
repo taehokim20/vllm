@@ -20,21 +20,37 @@ _permuted_weight_buffers: dict[int, tuple[int, torch.Tensor]] = {}
 
 
 def _get_permuted_weight(w: torch.Tensor) -> torch.Tensor:
-    """Return w permuted to [num_experts, max_loras, rank, feat_in]."""
+    """Return w permuted to [num_experts, max_loras, rank, feat_in].
+
+    Caches the result keyed on (data_ptr, version).  The cache is
+    automatically invalidated when the weight tensor is reallocated at a
+    different address (server restart) or mutated (version bump).
+    """
     key = w.data_ptr()
     ver = w._version
     entry = _permuted_weight_buffers.get(key)
     if entry is not None and entry[0] == ver:
-        return entry[1]
-    if entry is not None:
-        buf = entry[1]
-    else:
-        buf = torch.empty(
-            (w.shape[1], w.shape[0], w.shape[2], w.shape[3]),
-            dtype=w.dtype, device=w.device)
+        # Validate the cached buffer is still alive by checking its
+        # storage size.  After GPU memory cleanup between warmup phases,
+        # the cached tensor may have been freed (storage_offset would
+        # raise or storage().nbytes() would be 0).
+        try:
+            if entry[1].storage().nbytes() > 0:
+                return entry[1]
+        except Exception:
+            pass
+        # Cached buffer is stale — fall through to re-create
+    buf = torch.empty(
+        (w.shape[1], w.shape[0], w.shape[2], w.shape[3]),
+        dtype=w.dtype, device=w.device)
     buf.copy_(w.permute(1, 0, 2, 3))
     _permuted_weight_buffers[key] = (ver, buf)
     return buf
+
+
+def _clear_permuted_weight_cache() -> None:
+    """Clear the permuted weight cache.  Call before CUDA graph capture."""
+    _permuted_weight_buffers.clear()
 
 
 # ---------------------------------------------------------------------------

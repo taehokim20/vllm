@@ -33,7 +33,7 @@ from .punica_base import PunicaWrapperBase
 # ---------------------------------------------------------------------------
 # Control which kernel is used for prefill vs decode via environment variables:
 #
-#   VLLM_MOE_LORA_PREFILL_BACKEND = triton | cuda   (default: triton)
+#   VLLM_MOE_LORA_PREFILL_BACKEND = triton | cuda   (default: cuda)
 #   VLLM_MOE_LORA_DECODE_BACKEND  = triton | cuda   (default: cuda)
 #   VLLM_MOE_LORA_DECODE_THRESHOLD = <int>           (default: 0)
 #       When set > 0, use CUDA only when num_tokens <= threshold during
@@ -54,9 +54,9 @@ elif _legacy == "cuda":
     _MOE_PREFILL_USE_CUDA = True
     _MOE_DECODE_USE_CUDA = True
 else:
-    # Per-phase control (default: Triton for prefill, CUDA for decode)
+    # Per-phase control (default: CUDA for both prefill and decode)
     _MOE_PREFILL_USE_CUDA = (
-        _os.environ.get("VLLM_MOE_LORA_PREFILL_BACKEND", "triton").lower()
+        _os.environ.get("VLLM_MOE_LORA_PREFILL_BACKEND", "cuda").lower()
         == "cuda"
     )
     _MOE_DECODE_USE_CUDA = (
@@ -438,11 +438,13 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 num_tokens, self.lora_config.specialize_active_lora
             )
         )
-        # When using hybrid kernel selection, we need block-aligned metadata
-        # for the Triton path.  The CUDA path ignores sorted_token_ids and
-        # builds its own pair arrays, so block alignment doesn't hurt it.
-        # Only force naive when CUDA is used exclusively (both phases).
+        # Block-aligned metadata is needed for the Triton path.
+        # The CUDA path needs naive (unpadded) expert_ids matching
+        # num_tokens * top_k.  Force naive when CUDA is the default
+        # for both phases, since the Triton path is only used as
+        # fallback during CUDA graph capture.
         if _MOE_PREFILL_USE_CUDA and _MOE_DECODE_USE_CUDA:
+            naive_block_assignment = True
             naive_block_assignment = True
 
         if naive_block_assignment:
@@ -498,39 +500,20 @@ class PunicaWrapperGPU(PunicaWrapperBase):
     ) -> torch.Tensor:
         """Populate w_ptr and return a contiguous [num_slices, num_experts] slice.
 
-        Caches the result keyed on (num_slices, weight _versions) so repeated
-        calls with unchanged weights are free.
+        Always re-populates from the permuted weight buffers to avoid
+        stale GPU pointer issues during CUDA graph warmup/capture cycles.
         """
         from vllm.lora.ops.cuda_ops import _fill_w_ptr_vectorized, _get_permuted_weight
 
         num_slices = len(lora_weights)
         num_experts = lora_weights[0].shape[1]
 
-        # Check if cached version is still valid
-        cache_attr = f"_moe_wptr_cache_{tag}"
-        cached = getattr(self, cache_attr, None)
-        if cached is not None:
-            cached_key, cached_slice = cached
-            cached_nslices, cached_versions = cached_key
-            if cached_nslices == num_slices:
-                versions_match = True
-                for s in range(num_slices):
-                    if lora_weights[s]._version != cached_versions[s]:
-                        versions_match = False
-                        break
-                if versions_match:
-                    return cached_slice
-
-        # Populate w_ptr buffer
+        # Always re-populate w_ptr buffer from permuted weights
         for s in range(num_slices):
             w_perm = _get_permuted_weight(lora_weights[s])
             _fill_w_ptr_vectorized(w_ptr_buffer[s], w_perm, num_experts)
 
-        # Cache the contiguous slice
-        w_ptr_slice = w_ptr_buffer[:num_slices, :num_experts].contiguous()
-        versions = tuple(lora_weights[s]._version for s in range(num_slices))
-        setattr(self, cache_attr, ((num_slices, versions), w_ptr_slice))
-        return w_ptr_slice
+        return w_ptr_buffer[:num_slices, :num_experts].contiguous()
 
     def add_lora_fused_moe_cuda(
         self,
@@ -613,17 +596,11 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         else:
             topk_weights_flat = self._moe_ones[:num_pairs]
 
-        # ----- w_ptr (cached) -----
-        is_capturing = torch.cuda.is_current_stream_capturing()
-        if not is_capturing:
-            w_ptr_a = self._ensure_moe_w_ptr(
-                lora_a_stacked, self._moe_w_ptr_buffer_shrink, "shrink")
-            w_ptr_b = self._ensure_moe_w_ptr(
-                lora_b_stacked, self._moe_w_ptr_buffer_expand, "expand")
-        else:
-            # During capture, use previously cached slices
-            w_ptr_a = getattr(self, "_moe_wptr_cache_shrink", (None, None))[1]
-            w_ptr_b = getattr(self, "_moe_wptr_cache_expand", (None, None))[1]
+        # ----- w_ptr -----
+        w_ptr_a = self._ensure_moe_w_ptr(
+            lora_a_stacked, self._moe_w_ptr_buffer_shrink, "shrink")
+        w_ptr_b = self._ensure_moe_w_ptr(
+            lora_b_stacked, self._moe_w_ptr_buffer_expand, "expand")
 
         # ----- Shrink -----
         shrink_out = torch.zeros(
@@ -641,13 +618,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         total_feat_out = sum(feat_out_per_slice)
 
         # slice_start_loc
-        if not is_capturing:
-            loc = offset
-            for s in range(num_slices):
-                self._moe_slice_start_loc_cpu[s] = loc
-                loc += feat_out_per_slice[s]
-            self._moe_slice_start_loc_buffer[:num_slices].copy_(
-                self._moe_slice_start_loc_cpu[:num_slices], non_blocking=True)
+        loc = offset
+        for s in range(num_slices):
+            self._moe_slice_start_loc_cpu[s] = loc
+            loc += feat_out_per_slice[s]
+        self._moe_slice_start_loc_buffer[:num_slices].copy_(
+            self._moe_slice_start_loc_cpu[:num_slices], non_blocking=True)
 
         y_accum = torch.zeros(
             (num_tokens, total_feat_out),
@@ -669,11 +645,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         y_orig.add_(y_delta)
 
     def _use_cuda_for_moe_lora(self, num_tokens: int) -> bool:
-        """Decide whether to use CUDA BGMV or Triton for this call.
-
-        Uses num_tokens as the primary signal: small num_tokens = decode,
-        large num_tokens = prefill.  The threshold controls the cutoff.
-        """
+        """Decide whether to use CUDA BGMV or Triton for this call."""
         if _MOE_DECODE_THRESHOLD > 0:
             # Threshold mode: CUDA for small batches, Triton for large
             if num_tokens <= _MOE_DECODE_THRESHOLD:

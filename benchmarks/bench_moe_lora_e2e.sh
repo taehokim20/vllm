@@ -118,9 +118,9 @@ run_benchmark() {
 }
 
 # Run all three backends
-run_benchmark "triton"
 run_benchmark "cuda"
 run_benchmark "hybrid"
+run_benchmark "triton"
 
 echo ""
 echo "============================================"
