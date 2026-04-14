@@ -22,24 +22,14 @@ _permuted_weight_buffers: dict[int, tuple[int, torch.Tensor]] = {}
 def _get_permuted_weight(w: torch.Tensor) -> torch.Tensor:
     """Return w permuted to [num_experts, max_loras, rank, feat_in].
 
-    Caches the result keyed on (data_ptr, version).  The cache is
-    automatically invalidated when the weight tensor is reallocated at a
-    different address (server restart) or mutated (version bump).
+    Uses id(w) + version as cache key to avoid stale data when tensors
+    are freed and reallocated at the same GPU address (data_ptr reuse).
     """
-    key = w.data_ptr()
+    key = id(w)
     ver = w._version
     entry = _permuted_weight_buffers.get(key)
     if entry is not None and entry[0] == ver:
-        # Validate the cached buffer is still alive by checking its
-        # storage size.  After GPU memory cleanup between warmup phases,
-        # the cached tensor may have been freed (storage_offset would
-        # raise or storage().nbytes() would be 0).
-        try:
-            if entry[1].storage().nbytes() > 0:
-                return entry[1]
-        except Exception:
-            pass
-        # Cached buffer is stale — fall through to re-create
+        return entry[1]
     buf = torch.empty(
         (w.shape[1], w.shape[0], w.shape[2], w.shape[3]),
         dtype=w.dtype, device=w.device)

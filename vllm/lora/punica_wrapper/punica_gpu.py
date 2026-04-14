@@ -54,9 +54,9 @@ elif _legacy == "cuda":
     _MOE_PREFILL_USE_CUDA = True
     _MOE_DECODE_USE_CUDA = True
 else:
-    # Per-phase control (default: CUDA for both prefill and decode)
+    # Per-phase control (default: Triton for prefill, CUDA for decode)
     _MOE_PREFILL_USE_CUDA = (
-        _os.environ.get("VLLM_MOE_LORA_PREFILL_BACKEND", "cuda").lower()
+        _os.environ.get("VLLM_MOE_LORA_PREFILL_BACKEND", "triton").lower()
         == "cuda"
     )
     _MOE_DECODE_USE_CUDA = (
@@ -67,6 +67,9 @@ else:
 _MOE_DECODE_THRESHOLD = int(
     _os.environ.get("VLLM_MOE_LORA_DECODE_THRESHOLD", "0")
 )
+
+# Debug mode: set VLLM_MOE_LORA_DEBUG=1 to enable bounds checking and logging
+_MOE_DEBUG = _os.environ.get("VLLM_MOE_LORA_DEBUG", "0") == "1"
 
 # Need CUDA buffers if either phase uses CUDA
 USE_BGMV_MOE_CUDA = _MOE_PREFILL_USE_CUDA or _MOE_DECODE_USE_CUDA
@@ -445,7 +448,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         # fallback during CUDA graph capture.
         if _MOE_PREFILL_USE_CUDA and _MOE_DECODE_USE_CUDA:
             naive_block_assignment = True
-            naive_block_assignment = True
 
         if naive_block_assignment:
             expert_ids = topk_ids.reshape(-1)
@@ -508,9 +510,15 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         num_slices = len(lora_weights)
         num_experts = lora_weights[0].shape[1]
 
-        # Always re-populate w_ptr buffer from permuted weights
+        # Keep references to permuted weights alive for the duration of
+        # the kernel call.  Without this, the permuted buffer could be
+        # garbage-collected between _fill_w_ptr_vectorized (which stores
+        # raw data_ptr values) and the kernel launch that dereferences them.
+        if not hasattr(self, '_moe_perm_refs'):
+            self._moe_perm_refs = {}
         for s in range(num_slices):
             w_perm = _get_permuted_weight(lora_weights[s])
+            self._moe_perm_refs[(tag, s)] = w_perm  # prevent GC
             _fill_w_ptr_vectorized(w_ptr_buffer[s], w_perm, num_experts)
 
         return w_ptr_buffer[:num_slices, :num_experts].contiguous()
