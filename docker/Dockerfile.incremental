@@ -1,0 +1,43 @@
+# Incremental rebuild Dockerfile for kernel-only changes.
+#
+# Usage:
+#   docker build -t vllm-custom:v0.18.0-moe-bgmv-cuda-8 \
+#     -f docker/Dockerfile.incremental \
+#     --build-arg BASE_IMAGE=466380840868.dkr.ecr.us-west-2.amazonaws.com/vllm-custom:v0.18.0-moe-bgmv-cuda-7 \
+#     .
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Install CUDA dev headers needed for compilation
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        cuda-nvcc-12-9 \
+        libcusparse-dev-12-9 \
+        libcublas-dev-12-9 \
+        libcusolver-dev-12-9 \
+        libcurand-dev-12-9 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copy kernel sources and build script
+WORKDIR /workspace
+COPY csrc/lora/ csrc/lora/
+COPY docker/build_lora_kernel.py /tmp/build_lora_kernel.py
+
+# Build only _lora_C (targets sm_80/89/90 only)
+RUN cd /tmp && python3 /tmp/build_lora_kernel.py
+
+# Copy changed Python files
+COPY vllm/lora/ops/cuda_ops/ /tmp/py_cuda_ops/
+COPY vllm/lora/punica_wrapper/punica_gpu.py /tmp/py_punica_gpu.py
+RUN VLLM_DIR=$(python3 -c "import vllm, os; print(os.path.dirname(vllm.__file__))") && \
+    cp -r /tmp/py_cuda_ops/* ${VLLM_DIR}/lora/ops/cuda_ops/ && \
+    cp /tmp/py_punica_gpu.py ${VLLM_DIR}/lora/punica_wrapper/punica_gpu.py
+
+# Clean up (keep cuda-nvcc-12-9 — BenchPress needs `nvcc --version` at runtime)
+RUN apt-get remove -y libcusparse-dev-12-9 \
+        libcublas-dev-12-9 libcusolver-dev-12-9 libcurand-dev-12-9 && \
+    apt-get autoremove -y && \
+    rm -rf /workspace/csrc /tmp/build_lora_kernel.py /tmp/py_cuda_ops /tmp/py_punica_gpu.py
+
+WORKDIR /workspace
