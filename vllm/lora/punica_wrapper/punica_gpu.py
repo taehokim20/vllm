@@ -54,9 +54,9 @@ elif _legacy == "cuda":
     _MOE_PREFILL_USE_CUDA = True
     _MOE_DECODE_USE_CUDA = True
 else:
-    # Per-phase control (default: Triton for prefill, CUDA for decode)
+    # Per-phase control (default: Triton prefill, CUDA decode)
     _MOE_PREFILL_USE_CUDA = (
-        _os.environ.get("VLLM_MOE_LORA_PREFILL_BACKEND", "triton").lower()
+        _os.environ.get("VLLM_MOE_LORA_PREFILL_BACKEND", "cuda").lower()
         == "cuda"
     )
     _MOE_DECODE_USE_CUDA = (
@@ -135,11 +135,14 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         max_top_k = 64
         max_pairs = max_num_batched_tokens * max_top_k
 
-        # Weight pointer buffers (shrink and expand)
+        # Weight pointer buffers (shrink and expand) — stored as 1D,
+        # reshaped to [num_slices, num_experts] per call for contiguity.
         self._moe_w_ptr_buffer_shrink = torch.zeros(
-            max_slices, max_experts, dtype=torch.int64, device=device)
+            max_slices * max_experts, dtype=torch.int64, device=device)
         self._moe_w_ptr_buffer_expand = torch.zeros(
-            max_slices, max_experts, dtype=torch.int64, device=device)
+            max_slices * max_experts, dtype=torch.int64, device=device)
+        self._moe_w_ptr_max_experts = max_experts
+        self._moe_w_ptr_max_slices = max_slices
 
         # No-lora flag (CPU, updated in update_metadata)
         self._moe_no_lora_flag_cpu = torch.tensor(
@@ -163,6 +166,32 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         # Lora indices expanded for W2 (repeat_interleave is expensive;
         # we pre-allocate and fill in add_lora_fused_moe_cuda)
         self._moe_lora_indices_expanded = torch.empty(
+            max_pairs, dtype=torch.int64, device=device)
+
+        # Pre-allocated buffers for intermediate results (graph-capture safe)
+        max_feat_out = 16384  # covers all known model hidden dims
+        # Use bf16 since that's the common model dtype; the kernel
+        # output type matches input type which is always bf16 or fp16.
+        # We allocate two buffers (one per dtype) lazily if needed.
+        max_rank = self.lora_config.max_lora_rank
+        self._moe_shrink_out_bf16 = torch.zeros(
+            max_slices, max_pairs, max_rank,
+            dtype=torch.bfloat16, device=device)
+        self._moe_shrink_out_fp16 = torch.zeros(
+            max_slices, max_pairs, max_rank,
+            dtype=torch.float16, device=device)
+        self._moe_y_accum = torch.zeros(
+            max_num_batched_tokens * max_feat_out,
+            dtype=torch.float32, device=device)
+        self._moe_y_accum_max_feat = max_feat_out
+        self._moe_expert_ids_i64 = torch.empty(
+            max_pairs, dtype=torch.int64, device=device)
+        self._moe_lora_indices_i64 = torch.empty(
+            max_num_batched_tokens, dtype=torch.int64, device=device)
+        self._moe_topk_weights_flat = torch.empty(
+            max_pairs, dtype=torch.float32, device=device)
+        # Buffer for sorted_token_ids // top_k (avoids alloc from // op)
+        self._moe_sorted_token_ids_div = torch.empty(
             max_pairs, dtype=torch.int64, device=device)
 
     def update_metadata(
@@ -442,10 +471,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             )
         )
         # Block-aligned metadata is needed for the Triton path.
-        # The CUDA path needs naive (unpadded) expert_ids matching
-        # num_tokens * top_k.  Force naive when CUDA is the default
-        # for both phases, since the Triton path is only used as
-        # fallback during CUDA graph capture.
+        # The CUDA path needs naive (unpadded) expert_ids.
+        # Since we skip MoE LoRA during cudagraph capture and use
+        # CUDA for all eager execution, always force naive.
         if _MOE_PREFILL_USE_CUDA and _MOE_DECODE_USE_CUDA:
             naive_block_assignment = True
 
@@ -497,31 +525,30 @@ class PunicaWrapperGPU(PunicaWrapperBase):
     def _ensure_moe_w_ptr(
         self,
         lora_weights: tuple[torch.Tensor, ...],
-        w_ptr_buffer: torch.Tensor,
+        w_ptr_buffer_1d: torch.Tensor,
         tag: str,
     ) -> torch.Tensor:
-        """Populate w_ptr and return a contiguous [num_slices, num_experts] slice.
+        """Populate w_ptr and return a contiguous [num_slices, num_experts] view.
 
-        Always re-populates from the permuted weight buffers to avoid
-        stale GPU pointer issues during CUDA graph warmup/capture cycles.
+        Uses pre-allocated 1D buffer reshaped per call — graph-capture safe.
         """
         from vllm.lora.ops.cuda_ops import _fill_w_ptr_vectorized, _get_permuted_weight
 
         num_slices = len(lora_weights)
         num_experts = lora_weights[0].shape[1]
 
-        # Keep references to permuted weights alive for the duration of
-        # the kernel call.  Without this, the permuted buffer could be
-        # garbage-collected between _fill_w_ptr_vectorized (which stores
-        # raw data_ptr values) and the kernel launch that dereferences them.
+        # Reshape 1D buffer to 2D with exact dimensions → always contiguous
+        w_ptr = w_ptr_buffer_1d[:num_slices * num_experts].view(
+            num_slices, num_experts)
+
         if not hasattr(self, '_moe_perm_refs'):
             self._moe_perm_refs = {}
         for s in range(num_slices):
             w_perm = _get_permuted_weight(lora_weights[s])
-            self._moe_perm_refs[(tag, s)] = w_perm  # prevent GC
-            _fill_w_ptr_vectorized(w_ptr_buffer[s], w_perm, num_experts)
+            self._moe_perm_refs[(tag, s)] = w_perm
+            _fill_w_ptr_vectorized(w_ptr[s], w_perm, num_experts)
 
-        return w_ptr_buffer[:num_slices, :num_experts].contiguous()
+        return w_ptr
 
     def add_lora_fused_moe_cuda(
         self,
@@ -563,6 +590,19 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             num_tokens = x.size(0)
             num_tokens_orig = num_tokens
 
+        if _MOE_DEBUG:
+            tag = "W2" if is_w2 else "W13"
+            import sys
+            print(f"[MOE_CUDA {tag}] num_tokens={num_tokens} "
+                  f"num_tokens_orig={num_tokens_orig if is_w2 else num_tokens} "
+                  f"x.shape={list(x.shape)} y.shape={list(y.shape)} "
+                  f"num_slices={num_slices} rank={rank} "
+                  f"top_k={top_k_num} "
+                  f"expert_ids.shape={list(expert_ids.shape)} "
+                  f"lora_a[0].shape={list(lora_a_stacked[0].shape)} "
+                  f"lora_b[0].shape={list(lora_b_stacked[0].shape)}",
+                  file=sys.stderr, flush=True)
+
         # ----- lora_indices -----
         (
             token_lora_mapping_meta, _, _, _, _, _, _,
@@ -576,31 +616,46 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         if is_w2:
             num_pairs = num_tokens
-            src = token_lora_mapping.to(torch.int64)
-            idx = self._moe_seq_indices[:num_pairs] // top_k_num
+            # Copy lora mapping into pre-allocated i64 buffer (no alloc)
+            self._moe_lora_indices_i64[:num_tokens_orig].copy_(
+                token_lora_mapping)
+            src = self._moe_lora_indices_i64[:num_tokens_orig]
+            # Use pre-allocated buffer for division
+            torch.div(self._moe_seq_indices[:num_pairs], top_k_num,
+                       rounding_mode='trunc',
+                       out=self._moe_sorted_token_ids_div[:num_pairs])
+            idx = self._moe_sorted_token_ids_div[:num_pairs]
             torch.index_select(src, 0, idx,
                                out=self._moe_lora_indices_expanded[:num_pairs])
             lora_indices = self._moe_lora_indices_expanded[:num_pairs]
         else:
             num_pairs = total_pairs
-            lora_indices = token_lora_mapping.to(torch.int64)
+            # Copy into pre-allocated buffer instead of .to(int64)
+            self._moe_lora_indices_i64[:num_tokens_orig].copy_(
+                token_lora_mapping)
+            lora_indices = self._moe_lora_indices_i64[:num_tokens_orig]
 
         # ----- sorted_token_ids -----
         if is_w2:
             sorted_token_ids_i64 = self._moe_seq_indices[:num_pairs]
         else:
-            sorted_token_ids_i64 = self._moe_seq_indices[:num_pairs] // top_k_num
+            # Use pre-allocated buffer for division result
+            torch.div(self._moe_seq_indices[:num_pairs], top_k_num,
+                       rounding_mode='trunc',
+                       out=self._moe_sorted_token_ids_div[:num_pairs])
+            sorted_token_ids_i64 = self._moe_sorted_token_ids_div[:num_pairs]
 
-        # ----- expert_ids -----
-        expert_ids_i64 = expert_ids.view(-1).to(torch.int64)
-        if expert_ids_i64.size(0) > num_pairs:
-            expert_ids_i64 = expert_ids_i64[:num_pairs]
+        # ----- expert_ids (copy into pre-allocated i64 buffer) -----
+        n_eid = min(expert_ids.view(-1).size(0), num_pairs)
+        self._moe_expert_ids_i64[:n_eid].copy_(expert_ids.view(-1)[:n_eid])
+        expert_ids_i64 = self._moe_expert_ids_i64[:num_pairs]
 
         # ----- topk_weights -----
         if mul_routed_weight:
-            topk_weights_flat = topk_weights.view(-1).float()
-            if topk_weights_flat.size(0) > num_pairs:
-                topk_weights_flat = topk_weights_flat[:num_pairs]
+            n_tw = min(topk_weights.view(-1).size(0), num_pairs)
+            self._moe_topk_weights_flat[:n_tw].copy_(
+                topk_weights.view(-1)[:n_tw])
+            topk_weights_flat = self._moe_topk_weights_flat[:num_pairs]
         else:
             topk_weights_flat = self._moe_ones[:num_pairs]
 
@@ -610,10 +665,18 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         w_ptr_b = self._ensure_moe_w_ptr(
             lora_b_stacked, self._moe_w_ptr_buffer_expand, "expand")
 
-        # ----- Shrink -----
-        shrink_out = torch.zeros(
-            (num_slices, num_pairs, rank),
-            dtype=x.dtype, device=x.device)
+        # ----- Shrink (reuse pre-allocated buffer) -----
+        # Use flat 1D slice + reshape for guaranteed contiguity.
+        # Slicing buf[:S, :P] from [max_S, max_P, R] is non-contiguous
+        # when S>1 and P<max_P.
+        if x.dtype == torch.bfloat16:
+            shrink_buf = self._moe_shrink_out_bf16
+        else:
+            shrink_buf = self._moe_shrink_out_fp16
+        flat_elems = num_slices * num_pairs * rank
+        shrink_out = shrink_buf.view(-1)[:flat_elems].view(
+            num_slices, num_pairs, rank)
+        shrink_out.zero_()
 
         moe_cuda_shrink(
             shrink_out, x, w_ptr_a,
@@ -633,37 +696,37 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self._moe_slice_start_loc_buffer[:num_slices].copy_(
             self._moe_slice_start_loc_cpu[:num_slices], non_blocking=True)
 
-        y_accum = torch.zeros(
-            (num_tokens, total_feat_out),
-            dtype=torch.float32, device=x.device)
+        y_accum = self._moe_y_accum[:num_tokens * total_feat_out].view(
+            num_tokens, total_feat_out)
+        y_accum.zero_()
 
         moe_cuda_expand(
             y_accum, shrink_out, w_ptr_b,
             sorted_token_ids_i64, expert_ids_i64, topk_weights_flat,
             lora_indices,
-            self._moe_slice_start_loc_buffer[:num_slices].contiguous(),
+            self._moe_slice_start_loc_buffer[:num_slices],
             feat_out_per_slice)
 
-        # ----- Accumulate into caller's y -----
-        y_delta = y_accum.to(y_orig.dtype)
+        # ----- Accumulate into caller's y (avoid .to() allocation) -----
         if is_w2:
-            y_delta = y_delta.view(num_tokens_orig, top_k_num, total_feat_out)
-        if y_orig.dim() == 3 and y_delta.dim() == 2:
-            y_delta = y_delta.unsqueeze(1)
-        y_orig.add_(y_delta)
+            y_orig.add_(y_accum.view(num_tokens_orig, top_k_num,
+                                     total_feat_out))
+        elif y_orig.dim() == 3 and y_accum.dim() == 2:
+            y_orig.add_(y_accum.unsqueeze(1))
+        else:
+            y_orig.add_(y_accum)
 
     def _use_cuda_for_moe_lora(self, num_tokens: int) -> bool:
         """Decide whether to use CUDA BGMV or Triton for this call."""
         if _MOE_DECODE_THRESHOLD > 0:
-            # Threshold mode: CUDA for small batches, Triton for large
             if num_tokens <= _MOE_DECODE_THRESHOLD:
                 return _MOE_DECODE_USE_CUDA
             else:
                 return _MOE_PREFILL_USE_CUDA
-        # No threshold: use is_prefill flag
-        if self.is_prefill:
-            return _MOE_PREFILL_USE_CUDA
-        return _MOE_DECODE_USE_CUDA
+        # Default: use CUDA for all eager execution (both prefill and decode).
+        # Cudagraph capture is handled by the caller (add_lora_fused_moe)
+        # which skips the entire LoRA computation during capture.
+        return _MOE_PREFILL_USE_CUDA
 
     def add_lora_fused_moe(
         self,
@@ -689,10 +752,18 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         Performs a fused forward computation for LoRA of MoE layer.
 
         Routes between CUDA BGMV and Triton kernels based on:
-          - VLLM_MOE_LORA_PREFILL_BACKEND (default: triton)
+          - VLLM_MOE_LORA_PREFILL_BACKEND (default: cuda)
           - VLLM_MOE_LORA_DECODE_BACKEND  (default: cuda)
           - VLLM_MOE_LORA_DECODE_THRESHOLD (default: 0 = always)
         """
+        # Skip entirely during cudagraph capture — neither CUDA nor
+        # Triton MoE LoRA ops are capture-safe (they allocate GPU
+        # memory or use data-dependent tensor sizes).  During capture
+        # the model runs with dummy data and no real LoRA adapters,
+        # so the LoRA contribution is zero.
+        if torch.cuda.is_current_stream_capturing():
+            return
+
         num_tokens = x.size(0)
 
         if self._use_cuda_for_moe_lora(num_tokens):

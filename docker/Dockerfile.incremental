@@ -22,6 +22,7 @@ RUN apt-get update && \
 # Copy kernel sources and build script
 WORKDIR /workspace
 COPY csrc/lora/ csrc/lora/
+COPY csrc/core/registration.h csrc/core/registration.h
 COPY docker/build_lora_kernel.py /tmp/build_lora_kernel.py
 
 # Build only _lora_C (targets sm_80/89/90 only)

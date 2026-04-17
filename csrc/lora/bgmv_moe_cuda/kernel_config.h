@@ -1,26 +1,29 @@
 #pragma once
 
-// ── Base configuration (all architectures) ──
-// Improving point 1: RANK_TILE tiling.
-struct MoeShrinkKernelConfig {
-    static constexpr int tx = 32;       // threads per warp (x-dimension)
-    static constexpr int ty = 4;        // number of warps (y-dimension)
-    static constexpr int vec_size = 8;  // elements per vectorized load
-    static constexpr int rank_tile = 4; // rank elements per block
+// Target: H100/H200 (sm_90, 228 KB shared memory per SM)
 
-    // ── Improving point 2: multi-pair decode path ──
+struct MoeShrinkKernelConfig {
+    static constexpr int tx = 32;        // threads per warp (x-dimension)
+    static constexpr int ty = 4;         // number of warps (y-dimension)
+    static constexpr int vec_size = 8;   // elements per vectorized load
+    static constexpr int rank_tile = 8;  // rank elements per block (8× X reuse)
+
+    // Multi-pair decode path: PPB=4 pairs per block for decode,
     // PPB=1 for prefill (grid already saturates GPU).
-    // PPB=4 for decode on sm_80+ (uses dynamic shared memory).
-    // PPB=1 for decode on sm_70/75 (48 KB static shmem limit).
     static constexpr int pairs_per_block_prefill = 1;
     static constexpr int pairs_per_block_decode = 4;
     static constexpr int decode_threshold = 32;
 
-    // ── Improving point 3: deeper pipeline on sm_80+ ──
-    // 3 stages on sm_80+ (more shmem available via opt-in).
-    // 2 stages on sm_70/75 (48 KB static limit).
+    // Pipeline depth: 3 stages on sm_90 decode (216 KB / 228 KB = 95%),
+    // 2 stages for prefill (36 KB, leaves room for occupancy).
     static constexpr int num_stages_default = 2;
     static constexpr int num_stages_extended = 3;
+
+    // Shared memory budget (decode, PPB=4, 3 stages, RANK_TILE=8, fp16):
+    //   X: 3 × 4 × 1024 × 2 =  24 KB
+    //   W: 3 × 4 × 8 × 1024 × 2 = 192 KB
+    //   y: 4 × 8 × 4 × 4 =  512 B
+    //   Total: ~216 KB (fits 228 KB on H100/H200)
 };
 
 struct MoeExpandKernelConfig {
