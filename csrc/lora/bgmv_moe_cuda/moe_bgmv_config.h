@@ -11,17 +11,19 @@
 //   Nemotron-3-Super-120B-A12B: gate_up=(4096,2688), down=(2688,4096)
 //
 // TP-sharded dimensions added (TP=2,4):
-//   GPT-OSS-120B TP=2: 1536, 1472   |  TP=4: 768, 1472
+//   GPT-OSS-120B TP=2: 1536, 1472   |  TP=4: 768, 736, 1472
 //   Nemotron-Super TP=2: 2048, 1344  |  Qwen3-30B TP=2: 1024, 384
 //
-// All values must satisfy: wide % 64 == 0 (shrink kernel min tile).
-// Dimensions not meeting this (e.g. 736=2944/4) fall back to Triton.
+// All values must satisfy: wide % 32 == 0 (shrink kernel min tile with
+// vec_size=1).  Dimensions that are multiples of 64 get faster vec_size≥2
+// paths; 736 (=32×23) uses the vec_size=1 scalar path.
 //
 // Legacy dims kept for backward compat: 2880, 5120, 7168, 8192, 10240, 14336, 16384, 28672
 //
 // Union (sorted, deduplicated):
 #define FOR_MOE_ALL_WIDE(f, in_T, out_T, W_T, narrow) \
     f(in_T, out_T, W_T, narrow, 384)   \
+    f(in_T, out_T, W_T, narrow, 736)   \
     f(in_T, out_T, W_T, narrow, 768)   \
     f(in_T, out_T, W_T, narrow, 1024)  \
     f(in_T, out_T, W_T, narrow, 1344)  \

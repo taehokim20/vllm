@@ -186,8 +186,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         self._moe_y_accum_max_feat = max_feat_out
         self._moe_expert_ids_i64 = torch.empty(
             max_pairs, dtype=torch.int64, device=device)
-        self._moe_lora_indices_i64 = torch.empty(
-            max_num_batched_tokens, dtype=torch.int64, device=device)
+        self._moe_lora_indices_i64 = torch.full(
+            (max_num_batched_tokens,), -1, dtype=torch.int64, device=device)
         self._moe_topk_weights_flat = torch.empty(
             max_pairs, dtype=torch.float32, device=device)
         # Buffer for sorted_token_ids // top_k (avoids alloc from // op)
@@ -619,7 +619,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             # Copy lora mapping into pre-allocated i64 buffer (no alloc)
             self._moe_lora_indices_i64[:num_tokens_orig].copy_(
                 token_lora_mapping)
-            src = self._moe_lora_indices_i64[:num_tokens_orig]
+            # Clamp to valid range — token_lora_mapping may contain
+            # uninitialized values during profile_run on some TP ranks.
+            max_lora_id = self.lora_config.max_loras - 1
+            lora_buf = self._moe_lora_indices_i64[:num_tokens_orig]
+            lora_buf[(lora_buf < -1) | (lora_buf > max_lora_id)] = -1
+            src = lora_buf
             # Use pre-allocated buffer for division
             torch.div(self._moe_seq_indices[:num_pairs], top_k_num,
                        rounding_mode='trunc',
@@ -633,7 +638,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             # Copy into pre-allocated buffer instead of .to(int64)
             self._moe_lora_indices_i64[:num_tokens_orig].copy_(
                 token_lora_mapping)
-            lora_indices = self._moe_lora_indices_i64[:num_tokens_orig]
+            # Clamp to valid range — token_lora_mapping may contain
+            # uninitialized values during profile_run on some TP ranks.
+            max_lora_id = self.lora_config.max_loras - 1
+            lora_buf = self._moe_lora_indices_i64[:num_tokens_orig]
+            lora_buf[(lora_buf < -1) | (lora_buf > max_lora_id)] = -1
+            lora_indices = lora_buf
 
         # ----- sorted_token_ids -----
         if is_w2:
@@ -678,9 +688,36 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             num_slices, num_pairs, rank)
         shrink_out.zero_()
 
+        if _MOE_DEBUG:
+            import sys
+            num_experts_w = w_ptr_a.size(1)
+            eid_max = expert_ids_i64[:num_pairs].max().item()
+            eid_min = expert_ids_i64[:num_pairs].min().item()
+            stid_max = sorted_token_ids_i64[:num_pairs].max().item()
+            stid_min = sorted_token_ids_i64[:num_pairs].min().item()
+            lid_max = lora_indices.max().item()
+            lid_min = lora_indices.min().item()
+            print(f"[MOE_CUDA PRE-SHRINK] "
+                  f"shrink_out={list(shrink_out.shape)} "
+                  f"x={list(x.shape)} "
+                  f"w_ptr_a={list(w_ptr_a.shape)} "
+                  f"num_experts_w={num_experts_w} "
+                  f"expert_ids range=[{eid_min}, {eid_max}] "
+                  f"sorted_token_ids range=[{stid_min}, {stid_max}] "
+                  f"lora_indices range=[{lid_min}, {lid_max}] "
+                  f"num_pairs={num_pairs} num_tokens={num_tokens}",
+                  file=sys.stderr, flush=True)
+
         moe_cuda_shrink(
             shrink_out, x, w_ptr_a,
             sorted_token_ids_i64, expert_ids_i64, lora_indices)
+
+        if _MOE_DEBUG:
+            # Force sync to catch kernel errors immediately after shrink
+            torch.cuda.synchronize()
+            import sys
+            print(f"[MOE_CUDA] shrink completed OK", file=sys.stderr,
+                  flush=True)
 
         # ----- Expand -----
         feat_out_per_slice = [
@@ -706,6 +743,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             lora_indices,
             self._moe_slice_start_loc_buffer[:num_slices],
             feat_out_per_slice)
+
+        if _MOE_DEBUG:
+            torch.cuda.synchronize()
+            import sys
+            print(f"[MOE_CUDA] expand completed OK", file=sys.stderr,
+                  flush=True)
 
         # ----- Accumulate into caller's y (avoid .to() allocation) -----
         if is_w2:

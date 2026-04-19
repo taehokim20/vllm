@@ -363,6 +363,7 @@ void moe_bgmv_shrink_sliced(out_T *__restrict__ Y, const in_T *__restrict__ X,
   if constexpr (feat_in % (fvs * cfg_tx) == 0)         { DISPATCH(fvs); }
   else if constexpr (feat_in % (fvs/2 * cfg_tx) == 0)  { DISPATCH(fvs/2); }
   else if constexpr (feat_in % (fvs/4 * cfg_tx) == 0)  { DISPATCH(fvs/4); }
+  else if constexpr (feat_in % cfg_tx == 0)             { DISPATCH(1); }
 
 #undef DISPATCH
 #undef LAUNCH
