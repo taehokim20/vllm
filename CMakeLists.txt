@@ -1213,6 +1213,46 @@ define_extension_target(
   USE_SABI 3
   WITH_SOABI)
 
+#
+# _lora_C extension (MoE BGMV CUDA kernels for LoRA)
+#
+if(VLLM_GPU_LANG STREQUAL "CUDA")
+  set(VLLM_LORA_EXT_SRC
+    "csrc/lora/torch_bindings.cpp")
+
+  cuda_archs_loose_intersection(MOE_BGMV_ARCHS
+    "7.0;7.5;8.0;8.6;8.7;8.9;9.0" "${CUDA_ARCHS}")
+
+  if(MOE_BGMV_ARCHS)
+    set(MOE_BGMV_SRCS
+      "csrc/lora/moe_lora_ops.cu"
+      "csrc/lora/bgmv_moe_cuda/moe_bgmv_bf16_bf16_bf16.cu"
+      "csrc/lora/bgmv_moe_cuda/moe_bgmv_bf16_fp32_bf16.cu"
+      "csrc/lora/bgmv_moe_cuda/moe_bgmv_fp16_fp16_fp16.cu"
+      "csrc/lora/bgmv_moe_cuda/moe_bgmv_fp16_fp32_fp16.cu"
+      "csrc/lora/bgmv_moe_cuda/moe_bgmv_fp32_bf16_bf16.cu"
+      "csrc/lora/bgmv_moe_cuda/moe_bgmv_fp32_fp16_fp16.cu")
+    set_gencode_flags_for_srcs(
+      SRCS "${MOE_BGMV_SRCS}"
+      CUDA_ARCHS "${MOE_BGMV_ARCHS}")
+    list(APPEND VLLM_LORA_EXT_SRC "${MOE_BGMV_SRCS}")
+    message(STATUS "Building MoE BGMV CUDA kernels for archs: ${MOE_BGMV_ARCHS}")
+  else()
+    message(STATUS "Not building MoE BGMV CUDA kernels (requires SM70+)")
+  endif()
+
+  message(STATUS "Enabling MoE LoRA extension.")
+  define_extension_target(
+    _lora_C
+    DESTINATION vllm
+    LANGUAGE CUDA
+    SOURCES ${VLLM_LORA_EXT_SRC}
+    COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+    ARCHITECTURES ${VLLM_GPU_ARCHES}
+    USE_SABI 3
+    WITH_SOABI)
+endif()
+
 if(VLLM_GPU_LANG STREQUAL "HIP")
   #
   # _rocm_C extension

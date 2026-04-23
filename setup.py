@@ -680,6 +680,7 @@ class precompiled_wheel_utils:
                     "vllm/_C.abi3.so",
                     "vllm/_C_stable_libtorch.abi3.so",
                     "vllm/_moe_C.abi3.so",
+                    "vllm/_lora_C.abi3.so",
                     "vllm/_flashmla_C.abi3.so",
                     "vllm/_flashmla_extension_C.abi3.so",
                     "vllm/_sparse_flashmla_C.abi3.so",
@@ -990,6 +991,9 @@ if _is_cuda() or _is_hip():
     # Optional since this doesn't get built (produce an .so file). This is just
     # copying the relevant .py files from the source repository.
     ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
+
+if _is_cuda():
+    ext_modules.append(CMakeExtension(name="vllm._lora_C"))
 
 if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
