@@ -31,14 +31,14 @@ inline bool launch_moe_shrink_sliced_kernel(
     const int64_t *lora_indices,
     uint32_t feat_in, uint32_t feat_out,
     int64_t num_pairs, int64_t num_slices, int64_t num_experts,
-    int64_t num_tokens) {
+    int64_t num_tokens, int64_t lora_stride) {
 
   switch (pack_u32(feat_in, feat_out)) {
 #define CASE_MOE_SHRINK(in_T, out_T, W_T, narrow, wide)                    \
   case pack_u32(wide, narrow):                                              \
     moe_bgmv_shrink_sliced<wide, narrow, in_T, out_T, W_T>(                \
         Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices,            \
-        num_pairs, num_slices, num_experts, num_tokens, 1.0f);              \
+        num_pairs, num_slices, num_experts, num_tokens, lora_stride, 1.0f); \
     return true;
     FOR_MOE_ALL_WIDE_NARROW(CASE_MOE_SHRINK, T, T, T)
 #undef CASE_MOE_SHRINK
@@ -57,7 +57,7 @@ inline bool launch_moe_expand_sliced_kernel(
     const int64_t *slice_start_loc,
     uint32_t feat_in, uint32_t feat_out,
     int64_t num_pairs, int64_t num_slices, int64_t num_experts,
-    int64_t total_feat_out, int64_t num_tokens) {
+    int64_t total_feat_out, int64_t num_tokens, int64_t lora_stride) {
 
   switch (pack_u32(feat_in, feat_out)) {
 #define CASE_MOE_EXPAND(in_T, out_T, W_T, narrow, wide)                    \
@@ -65,7 +65,7 @@ inline bool launch_moe_expand_sliced_kernel(
     moe_bgmv_expand_sliced<narrow, wide, in_T, W_T>(                       \
         Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices,            \
         topk_weights, slice_start_loc, num_pairs, num_slices,               \
-        num_experts, total_feat_out, wide, num_tokens, 1.0f);              \
+        num_experts, total_feat_out, wide, num_tokens, lora_stride, 1.0f); \
     return true;
     FOR_MOE_ALL_WIDE_NARROW(CASE_MOE_EXPAND, T, T, T)
 #undef CASE_MOE_EXPAND
@@ -80,7 +80,8 @@ void dispatch_moe_shrink(torch::Tensor y, torch::Tensor x,
                          torch::Tensor w_ptr,
                          torch::Tensor sorted_token_ids,
                          torch::Tensor expert_ids,
-                         torch::Tensor lora_indices) {
+                         torch::Tensor lora_indices,
+                         int64_t lora_stride) {
   CHECK_INPUT(y); CHECK_INPUT(x); CHECK_INPUT(w_ptr);
   CHECK_INPUT(sorted_token_ids); CHECK_INPUT(expert_ids); CHECK_INPUT(lora_indices);
   CHECK_DIM(3, y); CHECK_DIM(2, x); CHECK_DIM(2, w_ptr);
@@ -109,7 +110,8 @@ void dispatch_moe_shrink(torch::Tensor y, torch::Tensor x,
         sorted_token_ids.data_ptr<int64_t>(),
         expert_ids.data_ptr<int64_t>(),
         lora_indices.data_ptr<int64_t>(),
-        feat_in, feat_out, num_pairs, num_slices, num_experts, num_tokens);
+        feat_in, feat_out, num_pairs, num_slices, num_experts, num_tokens,
+        lora_stride);
     break;
   case at::ScalarType::BFloat16:
     ok = launch_moe_shrink_sliced_kernel(
@@ -119,7 +121,8 @@ void dispatch_moe_shrink(torch::Tensor y, torch::Tensor x,
         sorted_token_ids.data_ptr<int64_t>(),
         expert_ids.data_ptr<int64_t>(),
         lora_indices.data_ptr<int64_t>(),
-        feat_in, feat_out, num_pairs, num_slices, num_experts, num_tokens);
+        feat_in, feat_out, num_pairs, num_slices, num_experts, num_tokens,
+        lora_stride);
     break;
   default:
     TORCH_CHECK(false, "MoE shrink: unsupported dtype: ", x.scalar_type());
@@ -137,7 +140,8 @@ void dispatch_moe_expand(torch::Tensor y, torch::Tensor x,
                          torch::Tensor topk_weights,
                          torch::Tensor lora_indices,
                          torch::Tensor slice_start_loc,
-                         std::vector<int64_t> output_slices) {
+                         std::vector<int64_t> output_slices,
+                         int64_t lora_stride) {
   CHECK_INPUT(y); CHECK_INPUT(x); CHECK_INPUT(w_ptr);
   CHECK_INPUT(sorted_token_ids); CHECK_INPUT(expert_ids);
   CHECK_INPUT(topk_weights); CHECK_INPUT(lora_indices); CHECK_INPUT(slice_start_loc);
@@ -179,7 +183,7 @@ void dispatch_moe_expand(torch::Tensor y, torch::Tensor x,
         topk_weights.data_ptr<float>(),
         slice_start_loc.data_ptr<int64_t>(),
         feat_in, first_feat_out, num_pairs, num_slices, num_experts,
-        total_feat_out, num_tokens);
+        total_feat_out, num_tokens, lora_stride);
     break;
   case at::ScalarType::BFloat16:
     ok = launch_moe_expand_sliced_kernel(
@@ -192,7 +196,7 @@ void dispatch_moe_expand(torch::Tensor y, torch::Tensor x,
         topk_weights.data_ptr<float>(),
         slice_start_loc.data_ptr<int64_t>(),
         feat_in, first_feat_out, num_pairs, num_slices, num_experts,
-        total_feat_out, num_tokens);
+        total_feat_out, num_tokens, lora_stride);
     break;
   default:
     TORCH_CHECK(false, "MoE expand: unsupported dtype: ", x.scalar_type());

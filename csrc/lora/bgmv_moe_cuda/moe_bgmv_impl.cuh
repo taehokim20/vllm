@@ -40,6 +40,7 @@ moe_bgmv_shrink_sliced_kernel(out_T *__restrict__ Y,
                                int64_t num_pairs,
                                int64_t num_experts,
                                int64_t num_tokens,
+                               int64_t lora_stride,
                                float scale) {
   const int slice_id       = blockIdx.z;
   const int pair_block_idx = blockIdx.x;
@@ -67,7 +68,7 @@ moe_bgmv_shrink_sliced_kernel(out_T *__restrict__ Y,
         if (lid >= 0) {
           X_tok[pp]  = X + token_idx * feat_in;
           W_base[pp] = w_ptr[slice_id * num_experts + eid]
-                       + (lid * feat_out + j0) * feat_in;
+                       + lid * lora_stride + j0 * feat_in;
           pair_valid[pp] = true;
           continue;
         }
@@ -130,29 +131,7 @@ moe_bgmv_shrink_sliced_kernel(out_T *__restrict__ Y,
 
   // ── Main loop ──
   for (size_t t = pro; t < num_tiles; ++t) {
-    // Load tile t
-    const size_t ls = t % NUM_STAGES;
-    const size_t tb = t * tile_size;
-    pipe.producer_acquire();
-#pragma unroll
-    for (int pp = 0; pp < PAIRS_PER_BLOCK; ++pp) {
-      if (pair_valid[pp] && tb + toff < feat_in) {
-        cuda::memcpy_async(
-            X_shared + (ls * PAIRS_PER_BLOCK + pp) * tile_size + toff,
-            X_tok[pp] + tb + toff,
-            cuda::aligned_size_t<X_copy_size>(X_copy_size), pipe);
-#pragma unroll
-        for (int r = 0; r < RANK_TILE; ++r)
-          if (j0 + r < feat_out)
-            cuda::memcpy_async(
-                W_shared + ((ls * PAIRS_PER_BLOCK + pp) * RANK_TILE + r) * tile_size + toff,
-                W_base[pp] + r * feat_in + tb + toff,
-                cuda::aligned_size_t<W_copy_size>(W_copy_size), pipe);
-      }
-    }
-    pipe.producer_commit();
-
-    // Compute tile t-pro
+    // Compute tile t-pro first (drain oldest stage before overwriting it)
     const size_t cs = (t - pro) % NUM_STAGES;
     pipe.consumer_wait();
     block.sync();
@@ -190,6 +169,28 @@ moe_bgmv_shrink_sliced_kernel(out_T *__restrict__ Y,
     }
     block.sync();
     pipe.consumer_release();
+
+    // Load tile t into the now-free stage
+    const size_t ls = t % NUM_STAGES;
+    const size_t tb = t * tile_size;
+    pipe.producer_acquire();
+#pragma unroll
+    for (int pp = 0; pp < PAIRS_PER_BLOCK; ++pp) {
+      if (pair_valid[pp] && tb + toff < feat_in) {
+        cuda::memcpy_async(
+            X_shared + (ls * PAIRS_PER_BLOCK + pp) * tile_size + toff,
+            X_tok[pp] + tb + toff,
+            cuda::aligned_size_t<X_copy_size>(X_copy_size), pipe);
+#pragma unroll
+        for (int r = 0; r < RANK_TILE; ++r)
+          if (j0 + r < feat_out)
+            cuda::memcpy_async(
+                W_shared + ((ls * PAIRS_PER_BLOCK + pp) * RANK_TILE + r) * tile_size + toff,
+                W_base[pp] + r * feat_in + tb + toff,
+                cuda::aligned_size_t<W_copy_size>(W_copy_size), pipe);
+      }
+    }
+    pipe.producer_commit();
   }
 
   // ── Epilogue ──
@@ -268,7 +269,8 @@ moe_bgmv_expand_sliced_kernel(float *__restrict__ Y,
                                const int64_t *__restrict__ slice_start_loc,
                                int64_t num_pairs, int64_t num_experts,
                                int64_t total_feat_out, int32_t current_feat_out,
-                               int64_t num_tokens, float scale) {
+                               int64_t num_tokens, int64_t lora_stride,
+                               float scale) {
   size_t pair_idx = blockIdx.x;
   size_t tile_idx = blockIdx.y;
   int64_t token_idx = sorted_token_ids[pair_idx];
@@ -280,7 +282,7 @@ moe_bgmv_expand_sliced_kernel(float *__restrict__ Y,
   float topk_w = topk_weights[pair_idx];
   int64_t col_offset = slice_start_loc[slice_id];
   const W_T *W = w_ptr[slice_id * num_experts + expert_id]
-                 + lora_id * current_feat_out * feat_in;
+                 + lora_id * lora_stride;
   auto block = cg::this_thread_block();
   vec_t<in_T, vec_size> x_vec;
   x_vec.load(X + slice_id * num_pairs * feat_in + pair_idx * feat_in
@@ -315,7 +317,7 @@ void moe_bgmv_shrink_sliced(out_T *__restrict__ Y, const in_T *__restrict__ X,
                              const int64_t *lora_indices,
                              int64_t num_pairs, int64_t num_slices,
                              int64_t num_experts, int64_t num_tokens,
-                             float scale) {
+                             int64_t lora_stride, float scale) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   constexpr int cfg_tx = MoeShrinkKernelConfig::tx;
   constexpr int cfg_ty = MoeShrinkKernelConfig::ty;
@@ -352,7 +354,7 @@ void moe_bgmv_shrink_sliced(out_T *__restrict__ Y, const in_T *__restrict__ X,
     dim3 g((int)((num_pairs+(PPB)-1)/(PPB)), gy, num_slices);                 \
     kfn<<<g, dim3(cfg_tx,cfg_ty), shmem, stream>>>(                            \
         Y,X,w_ptr,sorted_token_ids,expert_ids,lora_indices,                    \
-        num_pairs,num_experts,num_tokens,scale);                               \
+        num_pairs,num_experts,num_tokens,lora_stride,scale);                   \
   } while(0)
 
 #define DISPATCH(VS) do {                                                      \
@@ -380,7 +382,7 @@ void moe_bgmv_expand_sliced(float *__restrict__ Y, const in_T *__restrict__ X,
                              int64_t num_pairs, int64_t num_slices,
                              int64_t num_experts, int64_t total_feat_out,
                              int32_t current_feat_out, int64_t num_tokens,
-                             float scale) {
+                             int64_t lora_stride, float scale) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   constexpr size_t vec_size = MoeExpandKernelConfig::vec_size;
   constexpr int tz = MoeExpandKernelConfig::tz;
@@ -391,19 +393,19 @@ void moe_bgmv_expand_sliced(float *__restrict__ Y, const in_T *__restrict__ X,
     moe_bgmv_expand_sliced_kernel<feat_in,feat_out,vec_size,tx,ty,tz,in_T,W_T>
       <<<dim3(num_pairs,feat_out/(ty*tz),num_slices),dim3(tx,ty,tz),0,stream>>>(
         Y,X,w_ptr,sorted_token_ids,expert_ids,lora_indices,topk_weights,
-        slice_start_loc,num_pairs,num_experts,total_feat_out,current_feat_out,num_tokens,scale);
+        slice_start_loc,num_pairs,num_experts,total_feat_out,current_feat_out,num_tokens,lora_stride,scale);
   } else if constexpr (16%tx==0 && feat_out%(16/tx*tz)==0) {
     constexpr int ty=16/tx;
     moe_bgmv_expand_sliced_kernel<feat_in,feat_out,vec_size,tx,ty,tz,in_T,W_T>
       <<<dim3(num_pairs,feat_out/(ty*tz),num_slices),dim3(tx,ty,tz),0,stream>>>(
         Y,X,w_ptr,sorted_token_ids,expert_ids,lora_indices,topk_weights,
-        slice_start_loc,num_pairs,num_experts,total_feat_out,current_feat_out,num_tokens,scale);
+        slice_start_loc,num_pairs,num_experts,total_feat_out,current_feat_out,num_tokens,lora_stride,scale);
   } else if constexpr (8%tx==0 && feat_out%(8/tx*tz)==0) {
     constexpr int ty=8/tx;
     moe_bgmv_expand_sliced_kernel<feat_in,feat_out,vec_size,tx,ty,tz,in_T,W_T>
       <<<dim3(num_pairs,feat_out/(ty*tz),num_slices),dim3(tx,ty,tz),0,stream>>>(
         Y,X,w_ptr,sorted_token_ids,expert_ids,lora_indices,topk_weights,
-        slice_start_loc,num_pairs,num_experts,total_feat_out,current_feat_out,num_tokens,scale);
+        slice_start_loc,num_pairs,num_experts,total_feat_out,current_feat_out,num_tokens,lora_stride,scale);
   }
 }
 
@@ -413,13 +415,13 @@ void moe_bgmv_expand_sliced(float *__restrict__ Y, const in_T *__restrict__ X,
 #define INST_MOE_BGMV_SHRINK_SLICED(feat_in, feat_out, in_T, out_T, W_T)       \
   template void moe_bgmv_shrink_sliced<feat_in, feat_out, in_T, out_T, W_T>(   \
       out_T*, const in_T*, W_T**, const int64_t*, const int64_t*,              \
-      const int64_t*, int64_t, int64_t, int64_t, int64_t, float);
+      const int64_t*, int64_t, int64_t, int64_t, int64_t, int64_t, float);
 
 #define INST_MOE_BGMV_EXPAND_SLICED(feat_in, feat_out, in_T, W_T)              \
   template void moe_bgmv_expand_sliced<feat_in, feat_out, in_T, W_T>(          \
       float*, const in_T*, W_T**, const int64_t*, const int64_t*,              \
       const int64_t*, const float*, const int64_t*,                            \
-      int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, float);
+      int64_t, int64_t, int64_t, int64_t, int32_t, int64_t, int64_t, float);
 
 #define INST_MOE_BGMV_TWOSIDE(in_T, out_T, W_T, narrow, wide)                  \
   INST_MOE_BGMV_SHRINK_SLICED(wide, narrow, in_T, out_T, W_T)                 \

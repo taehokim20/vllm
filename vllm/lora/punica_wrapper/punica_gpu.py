@@ -131,8 +131,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
         max_slices = 2    # W13 has 2 slices (gate+up), W2 has 1
         max_experts = 512  # Nemotron-Super has 512
-        # Assume max top_k = 64 (covers all known MoE models)
-        max_top_k = 64
+        # max_top_k = 64
+        max_top_k = 8  # GPT-OSS uses 4, Nemotron-Nano uses 6
         max_pairs = max_num_batched_tokens * max_top_k
 
         # Weight pointer buffers (shrink and expand) — stored as 1D,
@@ -527,12 +527,14 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         lora_weights: tuple[torch.Tensor, ...],
         w_ptr_buffer_1d: torch.Tensor,
         tag: str,
-    ) -> torch.Tensor:
-        """Populate w_ptr and return a contiguous [num_slices, num_experts] view.
+    ) -> tuple[torch.Tensor, int]:
+        """Populate w_ptr and return (contiguous [num_slices, num_experts] view, lora_stride).
 
         Uses pre-allocated 1D buffer reshaped per call — graph-capture safe.
+        Works directly with the original weight layout [max_loras, num_experts, rank, feat]
+        without creating a transposed copy.
         """
-        from vllm.lora.ops.cuda_ops import _fill_w_ptr_vectorized, _get_permuted_weight
+        from vllm.lora.ops.cuda_ops import _fill_w_ptr_vectorized, _get_lora_stride
 
         num_slices = len(lora_weights)
         num_experts = lora_weights[0].shape[1]
@@ -541,14 +543,12 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         w_ptr = w_ptr_buffer_1d[:num_slices * num_experts].view(
             num_slices, num_experts)
 
-        if not hasattr(self, '_moe_perm_refs'):
-            self._moe_perm_refs = {}
+        # All slices must have the same lora_stride (same shape)
+        lora_stride = _get_lora_stride(lora_weights[0])
         for s in range(num_slices):
-            w_perm = _get_permuted_weight(lora_weights[s])
-            self._moe_perm_refs[(tag, s)] = w_perm
-            _fill_w_ptr_vectorized(w_ptr[s], w_perm, num_experts)
+            _fill_w_ptr_vectorized(w_ptr[s], lora_weights[s], num_experts)
 
-        return w_ptr
+        return w_ptr, lora_stride
 
     def add_lora_fused_moe_cuda(
         self,
@@ -670,9 +670,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             topk_weights_flat = self._moe_ones[:num_pairs]
 
         # ----- w_ptr -----
-        w_ptr_a = self._ensure_moe_w_ptr(
+        w_ptr_a, lora_stride_a = self._ensure_moe_w_ptr(
             lora_a_stacked, self._moe_w_ptr_buffer_shrink, "shrink")
-        w_ptr_b = self._ensure_moe_w_ptr(
+        w_ptr_b, lora_stride_b = self._ensure_moe_w_ptr(
             lora_b_stacked, self._moe_w_ptr_buffer_expand, "expand")
 
         # ----- Shrink (reuse pre-allocated buffer) -----
@@ -710,7 +710,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         moe_cuda_shrink(
             shrink_out, x, w_ptr_a,
-            sorted_token_ids_i64, expert_ids_i64, lora_indices)
+            sorted_token_ids_i64, expert_ids_i64, lora_indices,
+            lora_stride_a)
 
         if _MOE_DEBUG:
             # Force sync to catch kernel errors immediately after shrink
@@ -742,7 +743,8 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             sorted_token_ids_i64, expert_ids_i64, topk_weights_flat,
             lora_indices,
             self._moe_slice_start_loc_buffer[:num_slices],
-            feat_out_per_slice)
+            feat_out_per_slice,
+            lora_stride_b)
 
         if _MOE_DEBUG:
             torch.cuda.synchronize()
