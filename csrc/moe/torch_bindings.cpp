@@ -16,13 +16,14 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "bias) -> ()");
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
 
+#ifndef USE_ROCM
   m.def(
       "topk_softplus_sqrt(Tensor! topk_weights, Tensor! topk_indices, Tensor! "
       "token_expert_indices, Tensor gating_output, bool renormalize, float "
       "routed_scaling_factor, Tensor? "
       "bias, Tensor? input_ids, Tensor? tid2eid) -> ()");
   m.impl("topk_softplus_sqrt", torch::kCUDA, &topk_softplus_sqrt);
-
+#endif
   // Calculate the result of moe by summing up the partial results
   // from all selected experts.
   m.def("moe_sum(Tensor input, Tensor! output) -> ()");
@@ -37,6 +38,43 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "                     Tensor! num_tokens_post_pad,"
       "                     Tensor? maybe_expert_map) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
+
+#ifndef USE_ROCM
+  // Top-K Monokernel for Qwen3.5-35B FP8 block-wise (128×128) quantization
+  m.def(
+      "moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(Tensor "
+      "activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize,"
+      "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? rms_gamma, float rms_eps,"
+      "int ll_flag, int tp_rank, int tp_size) -> ()");
+  m.impl("moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
+         &moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl);
+
+  // TMA + WGMMA variant of the BS8 kernel — the only BS8 implementation.
+  // Selects USE_TMA=true via KernelConfig.  Callers must pre-interleave
+  // up-projection weights via `interleave_for_tma_wgmma_up` (Python).
+  // Down-projection weights are passed RAW — the TMA hardware applies
+  // SWIZZLE_128B at write time.
+  m.def(
+      "moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(Tensor "
+      "activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize,"
+      "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? rms_gamma, float rms_eps,"
+      "int ll_flag, int tp_rank, int tp_size) -> ()");
+  m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
+         torch::kCUDA,
+         &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl);
+#endif
 
   // Aligning the number of tokens to be processed by each expert such
   // that it is divisible by the block size, but for the batched case.
@@ -93,6 +131,16 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
 
   m.def(
+      "marlin_gemm_moe(Tensor! a, Tensor! b_q_weights, Tensor! sorted_ids, "
+      "Tensor! topk_weights, Tensor! topk_ids, Tensor! b_scales, Tensor! "
+      "b_zeros, Tensor! g_idx, Tensor! perm, Tensor! workspace, "
+      "int b_q_type, SymInt size_m, "
+      "SymInt size_n, SymInt size_k, bool is_k_full, int num_experts, int "
+      "topk, "
+      "int moe_block_size, bool replicate_input, bool apply_weights)"
+      " -> Tensor");
+
+  m.def(
       "moe_permute(Tensor input, Tensor topk_ids,"
       "Tensor token_expert_indices, Tensor? expert_map, int n_expert,"
       "int n_local_expert,"
@@ -122,14 +170,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
 
+  // cuBLAS bf16 x bf16 -> fp32 router GEMM (fallback for non-SM90 / batch > 16)
+  m.def("router_gemm_bf16_fp32(Tensor input, Tensor weight) -> Tensor");
+  m.impl("router_gemm_bf16_fp32", torch::kCUDA, &router_gemm_bf16_fp32);
+
   // DeepSeek V3 optimized router GEMM for SM90+
   m.def("dsv3_router_gemm(Tensor! output, Tensor mat_a, Tensor mat_b) -> ()");
-  // conditionally compiled so impl registration is in source file
-
-  // DeepSeek V4 fused RMSNorm + router GEMV for SM90+
-  m.def(
-      "dsv4_norm_router_gemm(Tensor! logits, Tensor! normed_x, Tensor x, "
-      "Tensor norm_weight, Tensor gate_weight, float eps) -> ()");
   // conditionally compiled so impl registration is in source file
 #endif
 }

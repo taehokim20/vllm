@@ -67,6 +67,44 @@ void shuffle_rows(const torch::Tensor& input_tensor,
                   torch::Tensor& output_tensor);
 
 #ifndef USE_ROCM
+// Top-K monokernel for Qwen3.5-35B FP8 block-wise (128×128) quantization
+// (E=256, K=2048, N=512, TP=1)
+void moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl(
+    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
+    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
+    bool renormalize);
+// WGMMA variant of the BS8 kernel — the only BS8 implementation. Switches
+// Phase 3 (up-proj) to wgmma.mma_async.
+void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_impl(
+    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
+    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
+    bool renormalize);
+// TMA + WGMMA variant of the BS8 kernel.  Same shape as the WGMMA reference
+// kernel above; selects the TMA-based weight + activation load path in
+// Phase 3 (spec R8.1, R8.2).
+void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl(
+    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
+    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
+    bool renormalize);
+#endif
+
+#ifndef USE_ROCM
+// cuBLAS bf16 x bf16 -> fp32 router GEMM (fallback for non-SM90 / batch > 16)
+torch::Tensor router_gemm_bf16_fp32(torch::Tensor const& input,
+                                    torch::Tensor const& weight);
+
 // DeepSeek V3 optimized router GEMM kernel for SM90+
 // Computes output = mat_a @ mat_b.T where:
 //   mat_a: [num_tokens, hidden_dim] in bf16
@@ -75,12 +113,4 @@ void shuffle_rows(const torch::Tensor& input_tensor,
 // Supports num_tokens in [1, 16], num_experts in {256, 384}, hidden_dim = 7168
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a,
                       const torch::Tensor& mat_b);
-
-// Fused RMSNorm + router GEMV for DeepSeek V4. Produces both:
-//   normed_x[m,k]      = x[m,k] * rsqrt(mean(x[m]^2) + eps) * norm_weight[k]
-//   logits[m,n]        = sum_k(normed_x[m,k] * gate_weight[n,k])
-// in a single kernel launch. Same dim/dtype constraints as dsv3_router_gemm.
-void dsv4_norm_router_gemm(at::Tensor& logits, at::Tensor& normed_x,
-                           at::Tensor const& x, at::Tensor const& norm_weight,
-                           at::Tensor const& gate_weight, double eps);
 #endif

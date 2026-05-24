@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -14,6 +13,7 @@ from vllm.utils.flashinfer import (
     flashinfer_quant_nvfp4_8x4_sf_layout,
 )
 from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -57,11 +57,11 @@ def create_fp4_scale_tensor(
         rounded_m = round_up(m, 128)
         scale_n = n // block_size
         rounded_n = round_up(scale_n, 4)
-        return torch.empty(
+        return torch.zeros(
             (rounded_m, rounded_n // 4), device=device, dtype=torch.int32
         )
     else:
-        return torch.empty((m, n // block_size), device=device, dtype=torch.uint8)
+        return torch.zeros((m, n // block_size), device=device, dtype=torch.uint8)
 
 
 def create_fp4_output_tensors(
@@ -69,20 +69,15 @@ def create_fp4_output_tensors(
     n: int,
     device: torch.device,
     is_sf_swizzled_layout: bool,
-    padded_n: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Allocate both output tensors for scaled_fp4_quant:
     (quantized_output, output_scale).
 
-    Must match the C++ scaled_fp4_quant_func allocation exactly when
-    ``padded_n`` is ``None``. When ``padded_n`` is provided, allocate a larger
-    packed-FP4 output/scale buffer so the quantization kernel can write
-    CUTLASS-compatible K padding directly
+    Must match the C++ scaled_fp4_quant_func allocation exactly.
     """
-    physical_n = padded_n if padded_n is not None else n
-    output = torch.empty((m, physical_n // 2), device=device, dtype=torch.uint8)
-    output_scale = create_fp4_scale_tensor(m, physical_n, device, is_sf_swizzled_layout)
+    output = torch.empty((m, n // 2), device=device, dtype=torch.uint8)
+    output_scale = create_fp4_scale_tensor(m, n, device, is_sf_swizzled_layout)
     return output, output_scale
 
 
@@ -205,6 +200,218 @@ def paged_attention_v2(
     )
 
 
+# Scoring function constants matching the CUDA enum ScoringFunc
+MOE_SCORING_SIGMOID = 0
+MOE_SCORING_SOFTMAX = 1
+
+
+def moe_monokernel_topk(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    scratchpad: torch.Tensor,
+    top_k: int = 1,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
+    # Fused AR + residual + RMSNorm parameters (Plan 1)
+    peer_ll_buffers: torch.Tensor | None = None,
+    residual_in: torch.Tensor | None = None,
+    rms_gamma: torch.Tensor | None = None,
+    rms_eps: float = 0.0,
+    ll_flag: int = 0,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> torch.Tensor:
+    """MoE monokernel with configurable top-K routing, scoring function,
+    and renormalization.
+
+    Supports top_k from 1 to 8, softmax or sigmoid scoring, and optional
+    weight renormalization. Designed for models like Qwen3 Coder FP8
+    (128 experts, top_k=8, softmax, renormalize=True).
+
+    Args:
+        activations_in: Input activations [M, K] in bfloat16
+        router_logits: Router logits [M, E] in bfloat16
+        expert_weights_up: Up-projection weights [E, 2*N, K] in fp8
+        expert_scales_up: Up-projection scales [E, 2*N, 1] in float32
+        expert_weights_down: Down-projection weights [E, K, N] in fp8
+        expert_scales_down: Down-projection scales [E, K, 1] in float32
+        scratchpad: Temporary storage tensor
+        top_k: Number of experts per token (1-8)
+        scoring_func: "softmax" or "sigmoid"
+        renormalize: Whether to renormalize top-K weights to sum to 1
+    """
+    if not current_platform.is_cuda():
+        raise NotImplementedError(
+            "The optimized moe kernel is only available on CUDA platforms"
+        )
+
+    assert activations_in.dim() == 2
+    assert router_logits.dim() == 2
+    assert expert_weights_up.dim() == 3
+    assert expert_scales_up.dim() == 3
+    assert expert_weights_down.dim() == 3
+    assert expert_scales_down.dim() == 3
+
+    assert activations_in.is_contiguous()
+    assert router_logits.is_contiguous()
+    assert expert_weights_up.is_contiguous()
+    assert expert_scales_up.is_contiguous()
+    assert expert_weights_down.is_contiguous()
+    assert expert_scales_down.is_contiguous()
+
+    assert 1 <= top_k <= 8, f"top_k must be between 1 and 8, got {top_k}"
+    assert scoring_func in ("softmax", "sigmoid"), (
+        f"scoring_func must be 'softmax' or 'sigmoid', got {scoring_func}"
+    )
+
+    scoring_func_int = (
+        MOE_SCORING_SOFTMAX if scoring_func == "softmax" else MOE_SCORING_SIGMOID
+    )
+
+    E = router_logits.size(1)
+    M = activations_in.size(0)
+    # Derive N and K from actual tensor shapes — works for any model/TP config
+    N = expert_weights_up.size(1)  # gate+up fused: 2*N_half
+    K = expert_weights_up.size(2)  # hidden states
+
+    assert router_logits.size() == (M, E), f"size is: {router_logits.size()}"
+    assert expert_weights_up.size() == (E, N, K), f"size is: {expert_weights_up.size()}"
+    assert expert_weights_down.size() == (E, K, N // 2), (
+        f"size is: {expert_weights_down.size()}"
+    )
+
+    # Scale shapes: block-wise (128×128) → [E, ceil(rows/128), ceil(cols/128)]
+    N_half = N // 2
+    up_scale_rows = (N + 127) // 128  # ceil(2*N_half / 128)
+    up_scale_cols = (K + 127) // 128  # ceil(K / 128)
+    down_scale_rows = (K + 127) // 128  # ceil(K / 128)
+    down_scale_cols = (N_half + 127) // 128  # ceil(N_half / 128)
+    assert expert_scales_up.size() == (E, up_scale_rows, up_scale_cols), (
+        f"expert_scales_up size is: {expert_scales_up.size()}, "
+        f"expected: ({E}, {up_scale_rows}, {up_scale_cols})"
+    )
+    assert expert_scales_down.size() == (E, down_scale_rows, down_scale_cols), (
+        f"expert_scales_down size is: {expert_scales_down.size()}, "
+        f"expected: ({E}, {down_scale_rows}, {down_scale_cols})"
+    )
+
+    assert activations_in.dtype is torch.bfloat16
+    assert router_logits.dtype is torch.bfloat16
+    assert expert_weights_up.dtype is torch.float8_e4m3fn
+    assert expert_scales_up.dtype is torch.float32
+    assert expert_weights_down.dtype is torch.float8_e4m3fn
+    assert expert_scales_down.dtype is torch.float32
+
+    assert M <= 64
+
+    # Allocate output tensor (separate from input for top-K accumulation)
+    activations_out = torch.zeros_like(activations_in)
+
+    # Dispatch to Qwen3.5-35B FP8 block-wise kernel (E=256, N=1024, K=2048, TP=1)
+    # N here is the fused gate+up dim = 2 * moe_intermediate_size (2*512=1024).
+    assert E == 256 and N == 1024 and K == 2048, (
+        f"moe_monokernel_topk: unsupported dims E={E}, N={N}, K={K}. "
+        "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
+    )
+    if M <= 8:
+        # BS8 uses the TMA+WGMMA kernel with SWIZZLE_128B on both weight
+        # sides.  The up-projection weights must be repacked via
+        # `interleave_for_tma_wgmma_up` (gate/up row interleave so one
+        # 128x128 TMA fetches a full WGMMA A-tile); the down-projection
+        # weights are passed raw — the TMA hardware applies the
+        # core-matrix XOR swizzle at write time.  The repack is cached
+        # on the weight tensor's `_tma_interleaved_up` attribute so
+        # subsequent calls with the same weights are free; model loaders
+        # can also apply the transform ahead of time.
+        from interleave_weights import interleave_for_tma_wgmma_up
+
+        up_interleaved = getattr(expert_weights_up, "_tma_interleaved_up", None)
+        if up_interleaved is None:
+            up_interleaved = interleave_for_tma_wgmma_up(expert_weights_up).contiguous()
+            try:
+                expert_weights_up._tma_interleaved_up = up_interleaved
+            except (AttributeError, RuntimeError):
+                pass
+
+        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(
+            activations_in,
+            router_logits,
+            up_interleaved,
+            expert_scales_up,
+            expert_weights_down,
+            expert_scales_down,
+            activations_out,
+            scratchpad,
+            top_k,
+            scoring_func_int,
+            renormalize,
+            peer_ll_buffers,
+            residual_in,
+            rms_gamma,
+            rms_eps,
+            ll_flag,
+            tp_rank,
+            tp_size,
+        )
+    else:
+        torch.ops._moe_C.moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(
+            activations_in,
+            router_logits,
+            expert_weights_up,
+            expert_scales_up,
+            expert_weights_down,
+            expert_scales_down,
+            activations_out,
+            scratchpad,
+            top_k,
+            scoring_func_int,
+            renormalize,
+            peer_ll_buffers,
+            residual_in,
+            rms_gamma,
+            rms_eps,
+            ll_flag,
+            tp_rank,
+            tp_size,
+        )
+
+    return activations_out
+
+
+def moe_monokernel_topk_fake(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    scratchpad: torch.Tensor,
+    top_k: int = 1,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
+    peer_ll_buffers: torch.Tensor | None = None,
+    residual_in: torch.Tensor | None = None,
+    rms_gamma: torch.Tensor | None = None,
+    rms_eps: float = 0.0,
+    ll_flag: int = 0,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+) -> torch.Tensor:
+    return torch.empty_like(activations_in)
+
+
+direct_register_custom_op(
+    op_name="moe_monokernel_topk",
+    op_func=moe_monokernel_topk,
+    mutates_args=[],
+    fake_impl=moe_monokernel_topk_fake,
+)
+
+
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sum: torch.Tensor,
@@ -283,6 +490,123 @@ def merge_attn_states(
         prefill_tokens_with_context,
         output_scale,
     )
+
+
+def convert_vertical_slash_indexes(
+    q_seqlens: torch.Tensor,  # [BATCH, ]
+    kv_seqlens: torch.Tensor,  # [BATCH, ]
+    vertical_indexes: torch.Tensor,  # [BATCH, N_HEADS, NNZ_V]
+    slash_indexes: torch.Tensor,  # [BATCH, N_HEADS, NNZ_S]
+    context_size: int,
+    block_size_M: int,
+    block_size_N: int,
+    causal: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = slash_indexes.size(0)
+    num_heads = slash_indexes.size(1)
+    nnz_slash = slash_indexes.size(2)
+    nnz_vertical = vertical_indexes.size(2)
+    num_rows = (context_size + block_size_M - 1) // block_size_M
+
+    block_count = torch.zeros(
+        batch_size, num_heads, num_rows, dtype=q_seqlens.dtype, device=q_seqlens.device
+    )
+    block_offset = torch.zeros(
+        batch_size,
+        num_heads,
+        num_rows,
+        nnz_slash,
+        dtype=q_seqlens.dtype,
+        device=q_seqlens.device,
+    )
+    column_count = torch.zeros(
+        batch_size, num_heads, num_rows, dtype=q_seqlens.dtype, device=q_seqlens.device
+    )
+    column_index = torch.zeros(
+        batch_size,
+        num_heads,
+        num_rows,
+        nnz_vertical,
+        dtype=q_seqlens.dtype,
+        device=q_seqlens.device,
+    )
+
+    torch.ops._C.convert_vertical_slash_indexes(
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        q_seqlens,
+        kv_seqlens,
+        vertical_indexes,
+        slash_indexes,
+        context_size,
+        block_size_M,
+        block_size_N,
+        causal,
+    )
+    return block_count, block_offset, column_count, column_index
+
+
+def convert_vertical_slash_indexes_mergehead(
+    q_seqlens: torch.Tensor,  # [BATCH, ]
+    kv_seqlens: torch.Tensor,  # [BATCH, ]
+    vertical_indexes: torch.Tensor,  # [BATCH, N_HEADS, NNZ_V]
+    slash_indexes: torch.Tensor,  # [BATCH, N_HEADS, NNZ_S]
+    # [N_HEADS] : different head use different number of indices
+    vertical_indices_count: torch.Tensor,
+    slash_indices_count: torch.Tensor,
+    context_size: int,
+    block_size_M: int,
+    block_size_N: int,
+    causal: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    batch_size = slash_indexes.size(0)
+    num_heads = slash_indexes.size(1)
+    nnz_slash = slash_indexes.size(2)
+    nnz_vertical = vertical_indexes.size(2)
+    num_rows = (context_size + block_size_M - 1) // block_size_M
+
+    block_count = torch.empty(
+        batch_size, num_heads, num_rows, dtype=q_seqlens.dtype, device=q_seqlens.device
+    )
+    block_offset = torch.empty(
+        batch_size,
+        num_heads,
+        num_rows,
+        nnz_slash,
+        dtype=q_seqlens.dtype,
+        device=q_seqlens.device,
+    )
+    column_count = torch.empty(
+        batch_size, num_heads, num_rows, dtype=q_seqlens.dtype, device=q_seqlens.device
+    )
+    column_index = torch.empty(
+        batch_size,
+        num_heads,
+        num_rows,
+        nnz_vertical,
+        dtype=q_seqlens.dtype,
+        device=q_seqlens.device,
+    )
+
+    torch.ops._C.convert_vertical_slash_indexes_mergehead(
+        block_count,
+        block_offset,
+        column_count,
+        column_index,
+        q_seqlens,
+        kv_seqlens,
+        vertical_indexes,
+        slash_indexes,
+        vertical_indices_count,
+        slash_indices_count,
+        context_size,
+        block_size_M,
+        block_size_N,
+        causal,
+    )
+    return block_count, block_offset, column_count, column_index
 
 
 # pos encoding ops
@@ -1602,7 +1926,6 @@ def scaled_fp4_quant(
     input_global_scale: torch.Tensor,
     is_sf_swizzled_layout: bool = True,
     backend: str = "none",
-    padded_n: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Quantize input tensor to FP4 and return quantized tensor and scale.
@@ -1617,8 +1940,6 @@ def scaled_fp4_quant(
         input: The input tensor to be quantized to FP4
         input_global_scale: A scalar scaling factor for the entire tensor.
         use_8x4_sf_layout: Whether to use the 8x4 or 128x4 layout for the scaling
-        padded_n: Optional padded K dimension. When provided, the quantized
-            output and scale tensors are allocated for ``padded_n``
 
     Returns:
         tuple[torch.Tensor, torch.Tensor]: The output tensor in FP4 but every
@@ -1636,16 +1957,9 @@ def scaled_fp4_quant(
     assert input.dtype in (torch.float16, torch.bfloat16), (
         f"input.dtype needs to be fp16 or bf16 but got {input.dtype}."
     )
-    if padded_n is not None:
-        assert padded_n >= n, f"padded_n must be >= n, got padded_n={padded_n}, n={n}."
-        assert padded_n % block_size == 0, (
-            f"padded_n has to be a multiple of {block_size}, but got {padded_n}."
-        )
 
     use_8x4_sf_layout = True if "trtllm" in backend and m <= 32 else False  # noqa: SIM210
-    if use_8x4_sf_layout and padded_n is not None and padded_n != n:
-        # TODO: support this case
-        raise ValueError("padded_n is not supported with TRTLLM 8x4 scale layout.")
+
     if use_8x4_sf_layout:
         output, output_scale = flashinfer_quant_nvfp4_8x4_sf_layout(
             input, input_global_scale
@@ -1653,11 +1967,7 @@ def scaled_fp4_quant(
     else:
         # Pre-allocate and call .out variant (same behavior as old in-place API)
         output, output_scale = create_fp4_output_tensors(
-            m,
-            n,
-            input.device,
-            is_sf_swizzled_layout,
-            padded_n=padded_n,
+            m, n, input.device, is_sf_swizzled_layout
         )
         torch.ops._C.scaled_fp4_quant.out(
             input,
@@ -2352,6 +2662,23 @@ def moe_wna16_gemm(
     )
 
 
+def router_gemm_bf16_fp32(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """bf16 x bf16 -> fp32 GEMM via cuBLAS. weight shape: (N, K)."""
+    return torch.ops._moe_C.router_gemm_bf16_fp32(input, weight)
+
+
+if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "router_gemm_bf16_fp32"):
+
+    @register_fake("_moe_C::router_gemm_bf16_fp32")
+    def router_gemm_bf16_fp32_fake(
+        input: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            input.shape[0], weight.shape[0], dtype=torch.float32, device=input.device
+        )
+
+
 def dsv3_router_gemm(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
@@ -2365,36 +2692,6 @@ def dsv3_router_gemm(
     )
     torch.ops._moe_C.dsv3_router_gemm(output, hidden_states, router_weight)
     return output
-
-
-def dsv4_norm_router_gemm(
-    x: torch.Tensor,
-    norm_weight: torch.Tensor,
-    gate_weight: torch.Tensor,
-    eps: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused RMSNorm + router GEMV for DeepSeek V4.
-
-    Returns ``(normed_x, router_logits)`` where
-        normed_x[m,k]      = x[m,k] * rsqrt(mean(x[m]^2) + eps) * norm_weight[k]
-        router_logits[m,n] = sum_k(normed_x[m,k] * gate_weight[n,k])
-
-    DSV4-specific constraints (caller must check before dispatching here):
-      - x, norm_weight, gate_weight all bf16 contiguous
-      - x.shape == [num_tokens, 7168] with num_tokens in [1, 16]
-      - gate_weight.shape == [num_experts, 7168] with num_experts in {256, 384}
-      - SM 9.x or 10.x device
-
-    Logits output is fp32 (hard-coded by DSV4 router).
-    """
-    num_tokens, hidden = x.shape
-    num_experts = gate_weight.shape[0]
-    normed_x = torch.empty_like(x)
-    logits = torch.empty(num_tokens, num_experts, device=x.device, dtype=torch.float32)
-    torch.ops._moe_C.dsv4_norm_router_gemm(
-        logits, normed_x, x, norm_weight, gate_weight, float(eps)
-    )
-    return normed_x, logits
 
 
 def topk_softmax(
@@ -2560,7 +2857,32 @@ def moe_wna16_marlin_gemm(
     )
 
 
-if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "moe_wna16_marlin_gemm"):
+if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "marlin_gemm_moe"):
+
+    @register_fake("_moe_C::marlin_gemm_moe")
+    def marlin_gemm_moe_fake(
+        a: torch.Tensor,
+        b_q_weights: torch.Tensor,
+        sorted_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        b_scales: torch.Tensor,
+        b_zero_points: torch.Tensor,
+        g_idx: torch.Tensor,
+        perm: torch.Tensor,
+        workspace: torch.Tensor,
+        b_q_type: ScalarType,
+        size_m: torch.SymInt,
+        size_n: torch.SymInt,
+        size_k: torch.SymInt,
+        is_k_full: bool,
+        num_experts: int,
+        topk: int,
+        moe_block_size: int,
+        replicate_input: bool,
+        apply_weights: bool,
+    ) -> torch.Tensor:
+        return torch.empty((size_m, topk, size_n), dtype=a.dtype, device=a.device)
 
     @register_fake("_moe_C::moe_wna16_marlin_gemm")
     def moe_wna16_marlin_gemm_fake(
@@ -2712,7 +3034,6 @@ def swap_blocks_batch(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
     sizes: torch.Tensor,
-    is_src_access_order_any: bool = False,
 ) -> None:
     """
     Batch version of swap_blocks: submit all copies in a single driver call.
@@ -2721,16 +3042,8 @@ def swap_blocks_batch(
     of sizes[i] bytes. All three tensors must be int64 CPU tensors.
     On CUDA 12.8+ this uses cuMemcpyBatchAsync for minimal submission
     overhead; on older CUDA it falls back to a loop of cudaMemcpyAsync.
-
-    is_src_access_order_any: if True, pass CU_MEMCPY_SRC_ACCESS_ORDER_ANY to
-        cuMemcpyBatchAsync, letting the DMA engine prefetch source bytes
-        out of stream order. Only safe when no GPU stream is concurrently
-        writing to the source. Defaults to False (STREAM ordering), which
-        is always safe.
     """
-    torch.ops._C_cache_ops.swap_blocks_batch(
-        src_ptrs, dst_ptrs, sizes, is_src_access_order_any
-    )
+    torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
 
 
 def convert_fp8(
@@ -2823,50 +3136,6 @@ def indexer_k_quant_and_cache(
 ) -> None:
     torch.ops._C_cache_ops.indexer_k_quant_and_cache(
         k, kv_cache, slot_mapping, quant_block_size, kv_cache_dtype
-    )
-
-
-def top_k_per_row_prefill(
-    logits: torch.Tensor,
-    cu_seqlen_ks: torch.Tensor,
-    cu_seqlen_ke: torch.Tensor,
-    raw_topk_indices: torch.Tensor,
-    num_rows: int,
-    stride0: int,
-    stride1: int,
-    topk_tokens: int,
-) -> None:
-    torch.ops._C.top_k_per_row_prefill(
-        logits,
-        cu_seqlen_ks,
-        cu_seqlen_ke,
-        raw_topk_indices,
-        num_rows,
-        stride0,
-        stride1,
-        topk_tokens,
-    )
-
-
-def top_k_per_row_decode(
-    logits: torch.Tensor,
-    next_n: int,
-    seq_lens: torch.Tensor,
-    raw_topk_indices: torch.Tensor,
-    num_rows: int,
-    stride0: int,
-    stride1: int,
-    topk_tokens: int,
-) -> None:
-    torch.ops._C.top_k_per_row_decode(
-        logits,
-        next_n,
-        seq_lens,
-        raw_topk_indices,
-        num_rows,
-        stride0,
-        stride1,
-        topk_tokens,
     )
 
 
@@ -3111,14 +3380,6 @@ if hasattr(torch.ops._C, "weight_packed_linear"):
         )
 
 
-class CPUQuantMethod(IntEnum):
-    UNQUANT = 0
-    INT8_W8A8 = 1
-    FP8_W8A16 = 2
-    INT4_W4A8 = 3
-    MXFP4 = 4
-
-
 if hasattr(torch.ops._C, "fused_experts_cpu"):
 
     @register_fake("_C::fused_experts_cpu")
@@ -3129,59 +3390,16 @@ if hasattr(torch.ops._C, "fused_experts_cpu"):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         inplace: bool,
-        moe_comp_method: CPUQuantMethod,
+        use_int8_w8a8: bool,
+        use_fp8_w8a16: bool,
         w1_scale: torch.Tensor | None,
         w2_scale: torch.Tensor | None,
-        w1_zero: torch.Tensor | None,
-        w2_zero: torch.Tensor | None,
         block_size: list[int] | None,
-        w1_bias: torch.Tensor | None,
-        w2_bias: torch.Tensor | None,
-        alpha: float | None,
-        limit: float | None,
+        a1_scale: torch.Tensor | None,
+        a2_scale: torch.Tensor | None,
         is_vnni: bool,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
-
-
-def fused_experts_cpu(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    topk_weights: torch.Tensor,
-    topk_ids: torch.Tensor,
-    inplace: bool,
-    moe_comp_method: CPUQuantMethod,
-    w1_scale: torch.Tensor | None,
-    w2_scale: torch.Tensor | None,
-    w1_zero: torch.Tensor | None,
-    w2_zero: torch.Tensor | None,
-    block_size: list[int] | None,
-    w1_bias: torch.Tensor | None = None,
-    w2_bias: torch.Tensor | None = None,
-    alpha: float | None = None,
-    limit: float | None = None,
-    is_vnni: bool = True,
-) -> torch.Tensor:
-    return torch.ops._C.fused_experts_cpu(
-        hidden_states,
-        w1,
-        w2,
-        topk_weights,
-        topk_ids,
-        inplace,
-        moe_comp_method,
-        w1_scale,
-        w2_scale,
-        w1_zero,
-        w2_zero,
-        block_size,
-        w1_bias,
-        w2_bias,
-        alpha,
-        limit,
-        is_vnni,
-    )
 
 
 if hasattr(torch.ops._C, "int8_scaled_mm_with_quant"):
@@ -3200,11 +3418,6 @@ if hasattr(torch.ops._C, "int8_scaled_mm_with_quant"):
         return torch.empty((M, N), dtype=out_dtype)
 
 
-class CPUQuantAlgo(IntEnum):
-    AWQ = 0
-    GPTQ = 1
-
-
 if hasattr(torch.ops._C, "convert_weight_packed_scale_zp"):
 
     @register_fake("_C::convert_weight_packed_scale_zp")
@@ -3212,27 +3425,12 @@ if hasattr(torch.ops._C, "convert_weight_packed_scale_zp"):
         qweight: torch.Tensor,
         qzeros: torch.Tensor,
         scales: torch.Tensor,
-        quant_method_4bit: CPUQuantAlgo,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (
             torch.empty_like(qweight),
             torch.empty_like(qzeros),
             torch.empty_like(scales),
         )
-
-
-def convert_weight_packed_scale_zp(
-    qweight: torch.Tensor,
-    qzeros: torch.Tensor,
-    scales: torch.Tensor,
-    quant_method_4bit: CPUQuantAlgo,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return torch.ops._C.convert_weight_packed_scale_zp(
-        qweight,
-        qzeros,
-        scales,
-        quant_method_4bit,
-    )
 
 
 if hasattr(torch.ops._C, "int4_scaled_mm_cpu"):
@@ -3249,188 +3447,7 @@ if hasattr(torch.ops._C, "int4_scaled_mm_cpu"):
         return torch.empty((x.size(0), N), dtype=x.dtype, device=x.device)
 
 
-def int4_scaled_mm_cpu(
-    x: torch.Tensor,
-    w: torch.Tensor,
-    w_zeros: torch.Tensor,
-    w_scales: torch.Tensor,
-    bias: torch.Tensor | None,
-) -> torch.Tensor:
-    x_shape = x.shape
-    x_2d = x.reshape(-1, x_shape[-1]) if len(x_shape) > 2 else x
-
-    out = torch.ops._C.int4_scaled_mm_cpu(
-        x_2d,
-        w,
-        w_zeros,
-        w_scales,
-        bias,
-    )
-    out = out.reshape(x_shape[:-1] + (out.size(-1),)) if len(x_shape) > 2 else out
-    return out
-
-
-if hasattr(torch.ops._C, "fp8_scaled_mm_cpu"):
-
-    @register_fake("_C::fp8_scaled_mm_cpu")
-    def fp8_scaled_mm_cpu_fake(
-        mat1: torch.Tensor,
-        mat2: torch.Tensor,
-        scales2: torch.Tensor,
-        block_size: list[int],
-        bias: torch.Tensor | None,
-        out_dtype: torch.dtype,
-        is_vnni: bool,
-    ) -> torch.Tensor:
-        M = mat1.size(0)
-        N = mat2.size(0)
-        return torch.empty((M, N), dtype=out_dtype, device=mat1.device)
-
-
-_supports_cpu_fp8_w8a16 = bool(hasattr(torch.ops._C, "fp8_scaled_mm_cpu"))
-
-
-def fp8_scaled_mm_cpu(
-    mat1: torch.Tensor,
-    mat2: torch.Tensor,
-    scales2: torch.Tensor,
-    block_size: list[int],
-    bias: torch.Tensor | None,
-    out_dtype: torch.dtype,
-    is_vnni: bool,
-) -> torch.Tensor:
-    return torch.ops._C.fp8_scaled_mm_cpu(
-        mat1, mat2, scales2, block_size, bias, out_dtype, is_vnni
-    )
-
-
-def chunk_gated_delta_rule_cpu(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    output_final_state: bool,
-    cu_seqlens: torch.Tensor,
-    head_first: bool,
-    use_qk_l2norm_in_kernel: bool,
-    eps: float = 1e-5,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops._C.chunk_gated_delta_rule_cpu(
-        query,
-        key,
-        value,
-        g,
-        beta,
-        initial_state,
-        output_final_state,
-        cu_seqlens,
-        head_first,
-        use_qk_l2norm_in_kernel,
-        eps,
-    )
-
-
-def fused_sigmoid_gating_delta_rule_update_cpu(
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    initial_state_source: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    use_qk_l2norm_in_kernel: bool,
-    softplus_beta: float = 1.0,
-    softplus_threshold: float = 20.0,
-) -> torch.Tensor:
-    return torch.ops._C.fused_sigmoid_gating_delta_rule_update_cpu(
-        A_log,
-        dt_bias,
-        q,
-        k,
-        v,
-        a,
-        b,
-        initial_state_source,
-        initial_state_indices,
-        cu_seqlens,
-        use_qk_l2norm_in_kernel,
-        softplus_beta,
-        softplus_threshold,
-    )
-
-
-def fused_gdn_gating_cpu(
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    b: torch.Tensor,
-    dt_bias: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops._C.fused_gdn_gating_cpu(
-        A_log,
-        a,
-        b,
-        dt_bias,
-    )
-
-
-def causal_conv1d_weight_pack(
-    weight: torch.Tensor,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_weight_pack(
-        weight,
-    )
-
-
-def causal_conv1d_fwd_cpu(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    conv_states: torch.Tensor | None,
-    query_start_loc: torch.Tensor | None,
-    cache_indices: torch.Tensor | None,
-    has_initial_state: torch.Tensor | None,
-    silu_activation: bool,
-    is_vnni: bool,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_fwd_cpu(
-        x,
-        weight,
-        bias,
-        conv_states,
-        query_start_loc,
-        cache_indices,
-        has_initial_state,
-        silu_activation,
-        -1,
-        is_vnni,
-    )
-
-
-def causal_conv1d_update_cpu(
-    x: torch.Tensor,
-    conv_states: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    silu_activation: bool,
-    conv_state_indices: torch.Tensor | None,
-    is_vnni: bool,
-) -> torch.Tensor:
-    return torch.ops._C.causal_conv1d_update_cpu(
-        x,
-        conv_states,
-        weight,
-        bias,
-        silu_activation,
-        None,
-        conv_state_indices,
-        -1,
-        is_vnni,
-    )
+_supports_cpu_w4a8_int8 = bool(hasattr(torch.ops._C, "convert_weight_packed_scale_zp"))
 
 
 class CPUDNNLGEMMHandler:
@@ -3599,9 +3616,6 @@ def cpu_attn_reshape_and_cache(
     value_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     isa: str,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-    kv_cache_dtype: str = "auto",
 ) -> None:
     torch.ops._C.cpu_attn_reshape_and_cache(
         key,
@@ -3610,9 +3624,6 @@ def cpu_attn_reshape_and_cache(
         value_cache,
         slot_mapping,
         isa,
-        k_scale,
-        v_scale,
-        kv_cache_dtype,
     )
 
 
@@ -3631,9 +3642,6 @@ def cpu_attention_with_kv_cache(
     softcap: float,
     scheduler_metadata: torch.Tensor,
     s_aux: torch.Tensor | None,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-    kv_cache_dtype: str = "auto",
 ) -> None:
     torch.ops._C.cpu_attention_with_kv_cache(
         query,
@@ -3651,9 +3659,6 @@ def cpu_attention_with_kv_cache(
         softcap,
         scheduler_metadata,
         s_aux,
-        k_scale,
-        v_scale,
-        kv_cache_dtype,
     )
 
 
