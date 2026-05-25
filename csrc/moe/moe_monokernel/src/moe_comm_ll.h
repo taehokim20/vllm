@@ -164,29 +164,39 @@ __device__ void phase5_fused_ar_ll(
   }
 
   // ── Step B: readLL + reduce + residual + RMSNorm ───────────────────
-  // We need the full token row for RMSNorm (variance over hidden_dim).
-  // But this block only owns col_tile columns. Two approaches:
-  //   (a) Each block computes partial variance over its stripe, then
-  //       a cross-block reduction gives the full variance.
-  //   (b) Each block does AR + residual for its stripe, writes to
-  //       activations_out, then a separate RMSNorm pass reads the
-  //       full row.
   //
-  // For simplicity in v1, we do (b): Phase 5 does AR + residual and
-  // writes the pre-norm result. RMSNorm is left as a trivial follow-up
-  // (either a second pass within this kernel or a tiny downstream kernel).
+  // Strategy for RMSNorm across blocks:
+  //   Each block owns DOWN_COL_TILE columns. RMSNorm needs variance over
+  //   the full HIDDEN_STATES dimension. We use a 3-sub-step approach:
   //
-  // TODO: Fuse RMSNorm into Phase 5 using cross-block shared-memory
-  // or a second grid-barrier + norm pass within the same kernel.
+  //   B1: AR reduce + residual → write pre-norm fp32 to activations_out
+  //       (temporarily as fp32 via reinterpret, or to a scratchpad region)
+  //       + compute partial sum-of-squares for this block's stripe.
+  //       Write partial_sq_sum[block_idx][tok] to scratchpad.
+  //
+  //   B2: grid_barrier — all Phase-5 blocks sync so partial_sq_sums are
+  //       visible. (Reuse the existing grid_barrier infrastructure.)
+  //       NOTE: We use spec->down_partial_out as scratch for the partial
+  //       sums since it's no longer needed after Step A consumed it.
+  //
+  //   B3: Each block reads all DOWN_GRID partial sums for its tokens,
+  //       computes the full variance, applies RMSNorm scale * gamma,
+  //       writes final bf16 to activations_out.
+  //
+  // Memory layout for partial sums (reusing down_partial_out):
+  //   spec->down_partial_out[block_idx * BS + tok] = partial_sq_sum
+  //   where block_idx ∈ [0, DOWN_GRID) and tok ∈ [0, batch_size)
 
+  constexpr uint32_t DOWN_GRID_P5 = Dims::HIDDEN_STATES / col_tile;
+
+  // ── B1: AR reduce + residual + compute partial sum-of-squares ──────
   for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;
        flat += blockDim.x) {
     const uint32_t tok = flat / packets_per_stripe;
     const uint32_t pkt_in_stripe = flat % packets_per_stripe;
     const uint32_t col = base_col + pkt_in_stripe * LL_ELEMS_PER_PACKET;
 
-    // Start with local value (already cast to bf16 above; re-read from
-    // down_partial_out to avoid storing intermediate)
+    // Start with local value
     float vals[LL_ELEMS_PER_PACKET];
 #pragma unroll
     for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
@@ -196,14 +206,12 @@ __device__ void phase5_fused_ar_ll(
     // Add peer contributions
     for (uint32_t peer = 0; peer < tp_size; ++peer) {
       if (peer == tp_rank) continue;
-      // Read from MY LL buffer, at the slot where this peer wrote
       LLPacket* my_buf = reinterpret_cast<LLPacket*>(peer_ll_buffers[tp_rank]);
       const uint32_t peer_ll_idx =
           peer * batch_size * packets_per_row +
           tok * packets_per_row + pkt_offset + pkt_in_stripe;
       uint64_t peer_data = readLL(&my_buf[peer_ll_idx], ll_flag);
 
-      // Unpack 4 bf16 values and accumulate as fp32
       __nv_bfloat16 peer_bf16[LL_ELEMS_PER_PACKET];
       memcpy(peer_bf16, &peer_data, sizeof(uint64_t));
 #pragma unroll
@@ -219,11 +227,102 @@ __device__ void phase5_fused_ar_ll(
       vals[i] += (float)residual_in[elem_offset + i];
     }
 
-    // Write pre-norm result (AR'd + residual) to activations_out
-    // RMSNorm will be applied in a follow-up pass (see TODO above)
+    // Write pre-norm result to activations_out (will be overwritten in B3
+    // with the normed value). Also write to residual_out if provided
+    // (the pre-norm value IS the updated residual for the next layer).
 #pragma unroll
     for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
       activations_out[elem_offset + i] = (R_element)vals[i];
+    }
+  }
+
+  // Compute partial sum-of-squares for this block's stripe.
+  // Each thread accumulates over its assigned packets, then we
+  // block-reduce to get one value per (block, token).
+  __syncthreads();
+
+  // Use shared memory for per-token partial sums within this block
+  // Reuse a small region — we only need BS floats.
+  extern __shared__ char phase5_smem[];
+  float* tok_partial_sq = reinterpret_cast<float*>(phase5_smem);
+  // Initialize
+  for (uint32_t t = threadIdx.x; t < batch_size; t += blockDim.x) {
+    tok_partial_sq[t] = 0.f;
+  }
+  __syncthreads();
+
+  for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;
+       flat += blockDim.x) {
+    const uint32_t tok = flat / packets_per_stripe;
+    const uint32_t pkt_in_stripe = flat % packets_per_stripe;
+    const uint32_t col = base_col + pkt_in_stripe * LL_ELEMS_PER_PACKET;
+    const uint32_t elem_offset = tok * Dims::HIDDEN_STATES + col;
+
+    float local_sq = 0.f;
+#pragma unroll
+    for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
+      float v = (float)activations_out[elem_offset + i];
+      local_sq += v * v;
+    }
+    atomicAdd(&tok_partial_sq[tok], local_sq);
+  }
+  __syncthreads();
+
+  // Write this block's partial sum-of-squares to scratchpad.
+  // Layout: down_partial_out[block_idx * BS + tok]
+  // (Reusing down_partial_out which is no longer needed.)
+  const uint32_t block_idx_in_grid = base_col / col_tile;
+  for (uint32_t t = threadIdx.x; t < batch_size; t += blockDim.x) {
+    spec->down_partial_out[block_idx_in_grid * Dims::BS + t] = tok_partial_sq[t];
+  }
+
+  // ── B2: barrier — wait for all Phase-5 blocks to write their partials ─
+  // We need a lightweight sync across the DOWN_GRID Phase-5 blocks.
+  // Use __threadfence() + a simple flag-based spin on the scratchpad.
+  // For correctness we need all DOWN_GRID blocks to have written before
+  // any block reads. We'll use a simple atomic counter approach.
+  __threadfence();  // Ensure our write to down_partial_out is visible
+
+  // Use the last element of down_partial_out as an atomic arrival counter
+  // (safe because we only use [0, DOWN_GRID * BS) elements above, and
+  // down_partial_out has BS * HIDDEN_STATES elements total — plenty of room)
+  uint32_t* arrival_counter = reinterpret_cast<uint32_t*>(
+      &spec->down_partial_out[Dims::BS * Dims::HIDDEN_STATES - 1]);
+
+  if (threadIdx.x == 0) {
+    atomicAdd(arrival_counter, 1u);
+    // Spin until all DOWN_GRID blocks have arrived
+    while (atomicAdd(arrival_counter, 0u) < DOWN_GRID_P5) {
+      // spin
+    }
+  }
+  __syncthreads();
+
+  // ── B3: compute full variance + apply RMSNorm ─────────────────────
+  for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;
+       flat += blockDim.x) {
+    const uint32_t tok = flat / packets_per_stripe;
+    const uint32_t pkt_in_stripe = flat % packets_per_stripe;
+    const uint32_t col = base_col + pkt_in_stripe * LL_ELEMS_PER_PACKET;
+    const uint32_t elem_offset = tok * Dims::HIDDEN_STATES + col;
+
+    // Sum partial sq sums across all blocks for this token
+    float total_sq = 0.f;
+    for (uint32_t b = 0; b < DOWN_GRID_P5; ++b) {
+      total_sq += spec->down_partial_out[b * Dims::BS + tok];
+    }
+
+    // RMSNorm scale
+    float rms_scale = rsqrtf(
+        total_sq / static_cast<float>(Dims::HIDDEN_STATES) + rms_eps);
+
+    // Apply gamma * scale and write final bf16
+#pragma unroll
+    for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
+      float pre_norm = (float)activations_out[elem_offset + i];
+      float gamma_val = (float)rms_gamma[col + i];
+      activations_out[elem_offset + i] =
+          (R_element)(pre_norm * rms_scale * gamma_val);
     }
   }
 
