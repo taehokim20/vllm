@@ -42,12 +42,6 @@ from typing import Optional
 
 import torch
 
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_world_size,
-)
-
 
 class MonokernelCommState:
     """
@@ -64,6 +58,7 @@ class MonokernelCommState:
         hidden_dim: int,
         tp_size: int,
         tp_rank: int,
+        tp_group=None,
     ):
         self.tp_size = tp_size
         self.tp_rank = tp_rank
@@ -74,10 +69,14 @@ class MonokernelCommState:
         if tp_size > 1:
             from vllm.distributed.moe_ll_workspace import MoELLWorkspace
 
+            if tp_group is None:
+                from vllm.distributed.parallel_state import get_tp_group
+                tp_group = get_tp_group().device_group
+
             self._workspace = MoELLWorkspace(
                 max_num_tokens=max_num_tokens,
                 hidden_dim=hidden_dim,
-                tp_group=get_tensor_model_parallel_group(),
+                tp_group=tp_group,
             )
 
     @staticmethod
@@ -92,6 +91,10 @@ class MonokernelCommState:
         needed). The returned state's get_kernel_kwargs() will return
         defaults that make Phase 5 use the original bf16-cast path.
         """
+        from vllm.distributed.parallel_state import (
+            get_tensor_model_parallel_rank,
+            get_tensor_model_parallel_world_size,
+        )
         tp_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         return MonokernelCommState(

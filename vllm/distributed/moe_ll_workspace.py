@@ -13,7 +13,7 @@ Usage (at model init, once per process):
     workspace = MoELLWorkspace(
         max_num_tokens=8,
         hidden_dim=2048,
-        tp_group=get_tensor_model_parallel_group(),
+        tp_group=get_tp_group().device_group,
     )
 
     # Pass to the monokernel:

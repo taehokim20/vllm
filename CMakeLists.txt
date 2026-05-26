@@ -1224,6 +1224,29 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
                    " in CUDA target architectures")
   endif()
 
+  # MoE Monokernel — fused routing + up-proj + SiLU + down-proj + AR
+  # Requires SM90a (Hopper TMA + WGMMA) and CUDA 12.0+
+  if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.0)
+    cuda_archs_loose_intersection(MOE_MONOKERNEL_ARCHS "9.0a" "${CUDA_ARCHS}")
+    if(MOE_MONOKERNEL_ARCHS)
+      set(MOE_MONOKERNEL_SRC
+        "csrc/moe/moe_monokernel/moe_wrapper.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "${MOE_MONOKERNEL_SRC}"
+        CUDA_ARCHS "${MOE_MONOKERNEL_ARCHS}")
+      # The monokernel uses extended lambda, relaxed constexpr, and
+      # large shared memory — pass the necessary nvcc flags.
+      set_source_files_properties(${MOE_MONOKERNEL_SRC} PROPERTIES
+        COMPILE_FLAGS "--expt-relaxed-constexpr --expt-extended-lambda -Xptxas -v")
+      list(APPEND VLLM_MOE_EXT_SRC "${MOE_MONOKERNEL_SRC}")
+      message(STATUS "Building MoE Monokernel for archs: ${MOE_MONOKERNEL_ARCHS}")
+    else()
+      message(STATUS "Not building MoE Monokernel — no SM90a arch in target list")
+    endif()
+  else()
+    message(STATUS "Not building MoE Monokernel — requires CUDA >= 12.0")
+  endif()
+
   # DeepSeek V3 router GEMM kernel - requires SM90+
   if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
     cuda_archs_loose_intersection(DSV3_ROUTER_GEMM_ARCHS "9.0a;10.0f;11.0f" "${CUDA_ARCHS}")
