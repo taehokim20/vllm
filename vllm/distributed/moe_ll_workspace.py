@@ -114,52 +114,78 @@ class MoELLWorkspace:
             self._peer_buffers = [self._local_buffer.data_ptr()]
             return
 
+        import ctypes
+
+        # Load CUDA runtime
+        cudart = ctypes.CDLL("libcudart.so")
+
+        # CUDA IPC handle is 64 bytes (cudaIpcMemHandle_t)
+        IPC_HANDLE_SIZE = 64
+
+        class CudaIpcMemHandle(ctypes.Structure):
+            _fields_ = [("reserved", ctypes.c_byte * IPC_HANDLE_SIZE)]
+
+        # Set proper argument/return types
+        cudart.cudaIpcGetMemHandle.restype = ctypes.c_int
+        cudart.cudaIpcGetMemHandle.argtypes = [
+            ctypes.POINTER(CudaIpcMemHandle),
+            ctypes.c_void_p,
+        ]
+        cudart.cudaIpcOpenMemHandle.restype = ctypes.c_int
+        cudart.cudaIpcOpenMemHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p),
+            CudaIpcMemHandle,
+            ctypes.c_uint,
+        ]
+
         # Get IPC handle for our local buffer
-        local_ptr = self._local_buffer.data_ptr()
-
-        # Use CUDA IPC to share memory handles
-        # Each rank broadcasts its device pointer to all others.
-        # On NVLink-connected GPUs within a node, we can use
-        # cudaIpcGetMemHandle / cudaIpcOpenMemHandle for true zero-copy.
-        #
-        # For simplicity in this first version, we use
-        # torch.distributed.all_gather to exchange raw device pointers.
-        # This works because on a single NVLink-connected node, all GPUs
-        # can access each other's memory via unified addressing (peer access).
-        #
-        # NOTE: This requires peer access to be enabled between all GPU pairs.
-        # On NVLink topologies this is automatic. On PCIe-only topologies
-        # this will fail — the fallback path (tp_size=1 behavior) handles that.
-
-        # Enable peer access between all GPU pairs
-        local_device = torch.cuda.current_device()
-        for peer_device in range(self.tp_size):
-            if peer_device != local_device:
-                try:
-                    torch.cuda.device(local_device)
-                    # cudaDeviceEnablePeerAccess is idempotent
-                    can_access = torch.cuda.can_device_access_peer(
-                        local_device, peer_device
-                    )
-                    if not can_access:
-                        raise RuntimeError(
-                            f"GPU {local_device} cannot peer-access GPU {peer_device}. "
-                            f"NVLink required for MoE LL all-reduce."
-                        )
-                except RuntimeError:
-                    raise
-
-        # All-gather device pointers
-        local_ptr_tensor = torch.tensor(
-            [local_ptr], dtype=torch.int64, device="cuda"
+        local_handle = CudaIpcMemHandle()
+        err = cudart.cudaIpcGetMemHandle(
+            ctypes.byref(local_handle),
+            ctypes.c_void_p(self._local_buffer.data_ptr()),
         )
-        all_ptrs = [
-            torch.zeros(1, dtype=torch.int64, device="cuda")
+        if err != 0:
+            raise RuntimeError(f"cudaIpcGetMemHandle failed with error {err}")
+
+        # Exchange IPC handles via all_gather
+        handle_bytes = bytes(local_handle.reserved)
+        local_handle_tensor = torch.tensor(
+            list(handle_bytes), dtype=torch.uint8, device="cuda"
+        )
+        all_handles = [
+            torch.zeros(IPC_HANDLE_SIZE, dtype=torch.uint8, device="cuda")
             for _ in range(self.tp_size)
         ]
-        dist.all_gather(all_ptrs, local_ptr_tensor, group=self.tp_group)
+        dist.all_gather(all_handles, local_handle_tensor, group=self.tp_group)
 
-        self._peer_buffers = [t.item() for t in all_ptrs]
+        # Open each peer's IPC handle to get a local pointer to their memory
+        self._peer_buffers = []
+        self._ipc_ptrs = []  # Keep references to prevent GC
+        for i in range(self.tp_size):
+            if i == self.tp_rank:
+                # Use our own local pointer directly
+                self._peer_buffers.append(self._local_buffer.data_ptr())
+            else:
+                # Open peer's IPC handle
+                peer_handle_bytes = all_handles[i].cpu().numpy().tobytes()
+                peer_handle = CudaIpcMemHandle()
+                ctypes.memmove(
+                    ctypes.byref(peer_handle.reserved),
+                    peer_handle_bytes,
+                    IPC_HANDLE_SIZE,
+                )
+                peer_ptr = ctypes.c_void_p()
+                err = cudart.cudaIpcOpenMemHandle(
+                    ctypes.byref(peer_ptr),
+                    peer_handle,
+                    1,  # cudaIpcMemLazyEnablePeerAccess
+                )
+                if err != 0:
+                    raise RuntimeError(
+                        f"cudaIpcOpenMemHandle for rank {i} failed with error {err}"
+                    )
+                self._peer_buffers.append(peer_ptr.value)
+                self._ipc_ptrs.append(peer_ptr)
 
     def next_flag(self) -> int:
         """

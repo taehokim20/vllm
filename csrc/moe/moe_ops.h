@@ -76,7 +76,11 @@ void moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl(
     const torch::Tensor& expert_weights_down,
     const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
     torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize);
+    bool renormalize,
+    const std::optional<torch::Tensor>& peer_ll_buffers,
+    const std::optional<torch::Tensor>& residual_in,
+    const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
+    int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
 // WGMMA variant of the BS8 kernel — the only BS8 implementation. Switches
 // Phase 3 (up-proj) to wgmma.mma_async.
 void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_impl(
@@ -86,7 +90,11 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_impl(
     const torch::Tensor& expert_weights_down,
     const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
     torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize);
+    bool renormalize,
+    const std::optional<torch::Tensor>& peer_ll_buffers,
+    const std::optional<torch::Tensor>& residual_in,
+    const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
+    int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
 // TMA + WGMMA variant of the BS8 kernel.  Same shape as the WGMMA reference
 // kernel above; selects the TMA-based weight + activation load path in
 // Phase 3 (spec R8.1, R8.2).
@@ -97,7 +105,11 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl(
     const torch::Tensor& expert_weights_down,
     const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
     torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize);
+    bool renormalize,
+    const std::optional<torch::Tensor>& peer_ll_buffers,
+    const std::optional<torch::Tensor>& residual_in,
+    const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
+    int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
 #endif
 
 #ifndef USE_ROCM

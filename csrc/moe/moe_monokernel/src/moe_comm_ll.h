@@ -48,8 +48,10 @@ __device__ __forceinline__ void storeLL(LLPacket* dst, uint64_t val,
                                         uint32_t flag) {
   uint32_t val_low = static_cast<uint32_t>(val);
   uint32_t val_high = static_cast<uint32_t>(val >> 32);
+  // Use system-scope store for cross-GPU (IPC) visibility via NVLink.
+  // st.relaxed.sys ensures the write is visible to all GPUs in the system.
   asm volatile(
-      "st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
+      "st.relaxed.sys.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
       :
       : "l"(dst), "r"(val_low), "r"(flag), "r"(val_high), "r"(flag)
       : "memory");
@@ -69,8 +71,9 @@ __device__ __forceinline__ uint64_t readLL(const LLPacket* src,
                                            uint32_t expected_flag) {
   uint32_t data1, flag1, data2, flag2;
   do {
+    // Use system-scope load for cross-GPU (IPC) visibility via NVLink.
     asm volatile(
-        "ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+        "ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(data1), "=r"(flag1), "=r"(data2), "=r"(flag2)
         : "l"(src)
         : "memory");
@@ -132,6 +135,20 @@ __device__ void phase5_fused_ar_ll(
   // Packet offset for this block's stripe within a token row
   const uint32_t pkt_offset = base_col / LL_ELEMS_PER_PACKET;
 
+  // Reset the B2 arrival counter at the start of Phase 5.
+  // The counter lives at the tail of down_partial_out and must be zero
+  // before any block increments it in B2.
+  constexpr uint32_t DOWN_GRID_P5 = Dims::HIDDEN_STATES / MoEGemmSpec<Dims>::DOWN_COL_TILE;
+  uint32_t* arrival_counter = reinterpret_cast<uint32_t*>(
+      &spec->down_partial_out[Dims::BS * Dims::HIDDEN_STATES - 1]);
+  if (threadIdx.x == 0 && base_col == 0) {
+    // Only one block (the first) resets the counter
+    *arrival_counter = 0u;
+  }
+  // All blocks must see the reset before proceeding
+  __threadfence();
+  __syncthreads();
+
   // ── Step A: cast fp32 → bf16 and storeLL to all peers ──────────────
   for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;
        flat += blockDim.x) {
@@ -163,6 +180,9 @@ __device__ void phase5_fused_ar_ll(
     }
   }
 
+  // Ensure all storeLL writes are visible to other GPUs (system-scope fence)
+  __threadfence_system();
+
   // ── Step B: readLL + reduce + residual + RMSNorm ───────────────────
   //
   // Strategy for RMSNorm across blocks:
@@ -186,8 +206,6 @@ __device__ void phase5_fused_ar_ll(
   // Memory layout for partial sums (reusing down_partial_out):
   //   spec->down_partial_out[block_idx * BS + tok] = partial_sq_sum
   //   where block_idx ∈ [0, DOWN_GRID) and tok ∈ [0, batch_size)
-
-  constexpr uint32_t DOWN_GRID_P5 = Dims::HIDDEN_STATES / col_tile;
 
   // ── B1: AR reduce + residual + compute partial sum-of-squares ──────
   for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;
@@ -286,8 +304,6 @@ __device__ void phase5_fused_ar_ll(
   // Use the last element of down_partial_out as an atomic arrival counter
   // (safe because we only use [0, DOWN_GRID * BS) elements above, and
   // down_partial_out has BS * HIDDEN_STATES elements total — plenty of room)
-  uint32_t* arrival_counter = reinterpret_cast<uint32_t*>(
-      &spec->down_partial_out[Dims::BS * Dims::HIDDEN_STATES - 1]);
 
   if (threadIdx.x == 0) {
     atomicAdd(arrival_counter, 1u);

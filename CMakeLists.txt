@@ -1094,7 +1094,8 @@ set(VLLM_MOE_EXT_SRC
 if(VLLM_GPU_LANG STREQUAL "CUDA")
   list(APPEND VLLM_MOE_EXT_SRC
     "csrc/moe/moe_wna16.cu"
-    "csrc/moe/grouped_topk_kernels.cu")
+    "csrc/moe/grouped_topk_kernels.cu"
+    "csrc/moe/router_gemm_bf16_fp32.cu")
 endif()
 
 if(VLLM_GPU_LANG STREQUAL "CUDA")
@@ -1230,7 +1231,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     cuda_archs_loose_intersection(MOE_MONOKERNEL_ARCHS "9.0a" "${CUDA_ARCHS}")
     if(MOE_MONOKERNEL_ARCHS)
       set(MOE_MONOKERNEL_SRC
-        "csrc/moe/moe_monokernel/moe_wrapper.cu")
+        "csrc/moe/moe_monokernel/moe_wrapper.cu"
+        "csrc/moe/moe_monokernel/src/moe_tma.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MOE_MONOKERNEL_SRC}"
         CUDA_ARCHS "${MOE_MONOKERNEL_ARCHS}")

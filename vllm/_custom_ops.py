@@ -327,7 +327,7 @@ def moe_monokernel_topk(
         # on the weight tensor's `_tma_interleaved_up` attribute so
         # subsequent calls with the same weights are free; model loaders
         # can also apply the transform ahead of time.
-        from interleave_weights import interleave_for_tma_wgmma_up
+        from vllm.model_executor.layers.fused_moe.interleave_weights import interleave_for_tma_wgmma_up
 
         up_interleaved = getattr(expert_weights_up, "_tma_interleaved_up", None)
         if up_interleaved is None:
