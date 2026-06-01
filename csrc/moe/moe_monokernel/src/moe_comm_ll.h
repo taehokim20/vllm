@@ -48,10 +48,9 @@ __device__ __forceinline__ void storeLL(LLPacket* dst, uint64_t val,
                                         uint32_t flag) {
   uint32_t val_low = static_cast<uint32_t>(val);
   uint32_t val_high = static_cast<uint32_t>(val >> 32);
-  // Use system-scope store for cross-GPU (IPC) visibility via NVLink.
-  // st.relaxed.sys ensures the write is visible to all GPUs in the system.
+  // volatile store for cross-GPU visibility (single-process, peer access)
   asm volatile(
-      "st.relaxed.sys.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
+      "st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
       :
       : "l"(dst), "r"(val_low), "r"(flag), "r"(val_high), "r"(flag)
       : "memory");
@@ -71,9 +70,9 @@ __device__ __forceinline__ uint64_t readLL(const LLPacket* src,
                                            uint32_t expected_flag) {
   uint32_t data1, flag1, data2, flag2;
   do {
-    // Use system-scope load for cross-GPU (IPC) visibility via NVLink.
+    // volatile load for cross-GPU visibility (single-process, peer access)
     asm volatile(
-        "ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+        "ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(data1), "=r"(flag1), "=r"(data2), "=r"(flag2)
         : "l"(src)
         : "memory");
