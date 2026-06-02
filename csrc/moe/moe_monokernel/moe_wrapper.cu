@@ -63,7 +63,12 @@ static_assert(
             const torch::Tensor& expert_weights_down,                          \
             const torch::Tensor& expert_scales_down,                           \
             torch::Tensor& activations_out, torch::Tensor& scratchpad,         \
-            int64_t top_k, int64_t scoring_func, bool renormalize) {           \
+            int64_t top_k, int64_t scoring_func, bool renormalize,             \
+            const std::optional<torch::Tensor>& peer_ll_buffers_opt,           \
+            const std::optional<torch::Tensor>& residual_in_opt,               \
+            const std::optional<torch::Tensor>& rms_gamma_opt,                 \
+            double rms_eps_dbl,                                                \
+            int64_t ll_flag_i64, int64_t tp_rank_i64, int64_t tp_size_i64) {   \
     TORCH_CHECK(                                                               \
         activations_in.is_cuda(),                                              \
         "Optimized MoE kernel must be called with CUDA tensors only.");        \
@@ -110,6 +115,27 @@ static_assert(
     const size_t scratchpad_size = scratchpad.nbytes();                        \
     const uint32_t top_k_u32 = static_cast<uint32_t>(top_k);                   \
     const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);             \
+                                                                               \
+    /* Fused AR + residual + RMSNorm parameters.                               \
+       When tp_size <= 1, these are nullptr/0 and Phase 5 does a plain         \
+       bf16 cast (original behavior). */                                       \
+    void** peer_ll_buffers_ptr =                                               \
+        peer_ll_buffers_opt.has_value()                                        \
+            ? reinterpret_cast<void**>(                                        \
+                  peer_ll_buffers_opt.value().data_ptr<int64_t>())             \
+            : nullptr;                                                         \
+    const at::BFloat16* residual_in_ptr =                                      \
+        residual_in_opt.has_value()                                            \
+            ? residual_in_opt.value().data_ptr<at::BFloat16>()                 \
+            : nullptr;                                                         \
+    const at::BFloat16* rms_gamma_ptr =                                        \
+        rms_gamma_opt.has_value()                                              \
+            ? rms_gamma_opt.value().data_ptr<at::BFloat16>()                   \
+            : nullptr;                                                         \
+    float rms_eps_f = static_cast<float>(rms_eps_dbl);                         \
+    uint32_t ll_flag_u32 = static_cast<uint32_t>(ll_flag_i64);                 \
+    uint32_t tp_rank_u32 = static_cast<uint32_t>(tp_rank_i64);                 \
+    uint32_t tp_size_u32 = static_cast<uint32_t>(tp_size_i64);                 \
                                                                                \
     /* TMA descriptors for the BS8 WGMMA up-projection path (spec R6.2,        \
        R6.3) and down-projection path (spec R9.1, R9.2, R9.3).  Non-TMA        \
@@ -174,7 +200,14 @@ static_assert(
                            (void*)&up_weights_desc,                            \
                            (void*)&activations_desc,                           \
                            (void*)&down_weights_desc,                          \
-                           (void*)&down_activations_desc};                     \
+                           (void*)&down_activations_desc,                      \
+                           (void*)&peer_ll_buffers_ptr,                        \
+                           (void*)&residual_in_ptr,                            \
+                           (void*)&rms_gamma_ptr,                              \
+                           (void*)&rms_eps_f,                                  \
+                           (void*)&ll_flag_u32,                                \
+                           (void*)&tp_rank_u32,                                \
+                           (void*)&tp_size_u32};                               \
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();              \
     CUDA_CHECK(cudaFuncSetAttribute(                                           \
         moe_kernel_topk<dims>, cudaFuncAttributeMaxDynamicSharedMemorySize,    \

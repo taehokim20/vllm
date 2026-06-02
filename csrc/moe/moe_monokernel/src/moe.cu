@@ -19,6 +19,7 @@
 #include "moe_tma.h"
 #include "moe_up_projection.cu"
 #include "moe_routing.cu"
+#include "moe_comm_ll.h"
 #undef INSIDE_MOE_MONOKERNEL_IMPLEMENTATION
 
 namespace moe_monokernel {
@@ -65,7 +66,12 @@ __device__ void moe_kernel_topk_BS8(
     CUtensorMap const& down_activations_desc,
     uint32_t* __restrict__ grid_counters, uint32_t& grid_phase,
     uint32_t* __restrict__ expert_counters, uint32_t& expert_phase,
-    uint32_t* __restrict__ colstripe_counters, uint32_t& colstripe_phase) {
+    uint32_t* __restrict__ colstripe_counters, uint32_t& colstripe_phase,
+    // Fused AR parameters
+    void** __restrict__ peer_ll_buffers,
+    const R_element* __restrict__ residual_in,
+    const R_element* __restrict__ rms_gamma,
+    float rms_eps, uint32_t ll_flag, uint32_t tp_rank, uint32_t tp_size) {
   static_assert(Dims::BS <= 8);
   static_assert(use_wgmma<Dims>::value,
                 "BS8 path requires the WGMMA configuration (use_wgmma).");
@@ -433,29 +439,32 @@ __device__ void moe_kernel_topk_BS8(
   const std::uint32_t base_col_r = down_block_idx_r * DOWN_COL_TILE_LOCAL;
 
   if (down_group_r == 0) {
-    // Phase 5 with atomicAdd writeback: read the SINGLE fp32 cell at
-    // `partial[tok][col]` (already the sum across all 16 contributing
-    // blocks via Phase-4 atomicAdds) and cast to bf16.  No DOWN_GROUPS
-    // dimension to reduce over — this is just a streaming
-    // load + cast + store.
-    for (std::uint32_t flat = threadIdx.x;
-         flat < batch_size * DOWN_COL_TILE_LOCAL; flat += blockDim.x) {
-      const std::uint32_t tok = flat / DOWN_COL_TILE_LOCAL;
-      const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
-      const std::uint32_t col = base_col_r + col_in_block;
-      const float v = spec->down_partial_out[tok * Dims::HIDDEN_STATES + col];
-      activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)v;
-    }
+    if (tp_size > 1 && peer_ll_buffers != nullptr) {
+      // ── Fused AR (LL protocol) + residual + RMSNorm ──────────────────
+      phase5_fused_ar_ll<Dims>(spec, activations_out, residual_in, rms_gamma,
+                               rms_eps, peer_ll_buffers, ll_flag, tp_rank,
+                               tp_size, batch_size, base_col_r,
+                               DOWN_COL_TILE_LOCAL);
+    } else {
+      // ── Original Phase 5: plain fp32 → bf16 cast (tp_size == 1) ────
+      for (std::uint32_t flat = threadIdx.x;
+           flat < batch_size * DOWN_COL_TILE_LOCAL; flat += blockDim.x) {
+        const std::uint32_t tok = flat / DOWN_COL_TILE_LOCAL;
+        const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
+        const std::uint32_t col = base_col_r + col_in_block;
+        const float v = spec->down_partial_out[tok * Dims::HIDDEN_STATES + col];
+        activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)v;
+      }
 
-    // Zero out activations_out[tok] for tok in [batch_size, Dims::BS)
-    // for this block's DOWN_COL_TILE col stripe.
-    for (std::uint32_t flat = threadIdx.x;
-         flat < (Dims::BS - batch_size) * DOWN_COL_TILE_LOCAL;
-         flat += blockDim.x) {
-      const std::uint32_t tok = batch_size + flat / DOWN_COL_TILE_LOCAL;
-      const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
-      const std::uint32_t col = base_col_r + col_in_block;
-      activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)0.0f;
+      // Zero out activations_out[tok] for tok in [batch_size, Dims::BS)
+      for (std::uint32_t flat = threadIdx.x;
+           flat < (Dims::BS - batch_size) * DOWN_COL_TILE_LOCAL;
+           flat += blockDim.x) {
+        const std::uint32_t tok = batch_size + flat / DOWN_COL_TILE_LOCAL;
+        const std::uint32_t col_in_block = flat % DOWN_COL_TILE_LOCAL;
+        const std::uint32_t col = base_col_r + col_in_block;
+        activations_out[tok * Dims::HIDDEN_STATES + col] = (R_element)0.0f;
+      }
     }
   }
 
@@ -559,7 +568,15 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
     __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
-    __grid_constant__ CUtensorMap const down_activations_desc) {
+    __grid_constant__ CUtensorMap const down_activations_desc,
+    // Fused AR + residual + RMSNorm parameters
+    void** __restrict__ peer_ll_buffers,
+    const R_element* __restrict__ residual_in,
+    const R_element* __restrict__ rms_gamma,
+    float rms_eps,
+    std::uint32_t ll_flag,
+    std::uint32_t tp_rank,
+    std::uint32_t tp_size) {
   // ── Compile-time preconditions on `Dims` (spec R7.3, R11.3) ─────────────
   // These fire at the first point where `Dims` is instantiated, so any
   // misconfigured variant is caught at compile time before any TMA /
@@ -684,7 +701,9 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
         activations_out, top_k, scoring_func, renormalize, spec, shmem,
         up_weights_desc, activations_desc, down_weights_desc,
         down_activations_desc, grid_counters, grid_phase, expert_counters,
-        expert_phase, colstripe_counters, colstripe_phase);
+        expert_phase, colstripe_counters, colstripe_phase,
+        peer_ll_buffers, residual_in, rms_gamma, rms_eps, ll_flag,
+        tp_rank, tp_size);
   } else {
     moe_kernel_topk_BS64<Dims>(
         activations_in, token_count, router_logits, expert_weights_up,

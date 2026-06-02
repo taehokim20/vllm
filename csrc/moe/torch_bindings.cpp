@@ -48,7 +48,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor expert_weights_up, Tensor expert_scales_up,"
       "Tensor expert_weights_down, Tensor expert_scales_down,"
       "Tensor! activations_out, Tensor! scratchpad,"
-      "int top_k, int scoring_func, bool renormalize) -> ()");
+      "int top_k, int scoring_func, bool renormalize,"
+      "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? rms_gamma, float rms_eps,"
+      "int ll_flag, int tp_rank, int tp_size) -> ()");
   m.impl("moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
          &moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl);
 
@@ -67,7 +70,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor expert_weights_up, Tensor expert_scales_up,"
       "Tensor expert_weights_down, Tensor expert_scales_down,"
       "Tensor! activations_out, Tensor! scratchpad,"
-      "int top_k, int scoring_func, bool renormalize) -> ()");
+      "int top_k, int scoring_func, bool renormalize,"
+      "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? rms_gamma, float rms_eps,"
+      "int ll_flag, int tp_rank, int tp_size) -> ()");
   m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
          torch::kCUDA,
          &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl);
