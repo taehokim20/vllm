@@ -1103,6 +1103,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/ptx_utils.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_tma.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_debug.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/csrc/moe/moe_monokernel/src/moe_comm_ll.h"
     )
     # moe_tma.cu depends on moe_tma.h; declare so rebuilds happen when
     # the header changes.

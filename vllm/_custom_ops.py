@@ -217,6 +217,14 @@ def moe_monokernel_topk(
     top_k: int = 1,
     scoring_func: str = "softmax",
     renormalize: bool = True,
+    # Fused AR + residual + RMSNorm parameters (Plan 1)
+    peer_ll_buffers: torch.Tensor | None = None,
+    residual_in: torch.Tensor | None = None,
+    rms_gamma: torch.Tensor | None = None,
+    rms_eps: float = 0.0,
+    ll_flag: int = 0,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> torch.Tensor:
     """MoE monokernel with configurable top-K routing, scoring function,
     and renormalization.
@@ -345,6 +353,13 @@ def moe_monokernel_topk(
             top_k,
             scoring_func_int,
             renormalize,
+            peer_ll_buffers,
+            residual_in,
+            rms_gamma,
+            rms_eps,
+            ll_flag,
+            tp_rank,
+            tp_size,
         )
     else:
         torch.ops._moe_C.moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(
@@ -359,6 +374,13 @@ def moe_monokernel_topk(
             top_k,
             scoring_func_int,
             renormalize,
+            peer_ll_buffers,
+            residual_in,
+            rms_gamma,
+            rms_eps,
+            ll_flag,
+            tp_rank,
+            tp_size,
         )
 
     return activations_out
@@ -375,6 +397,13 @@ def moe_monokernel_topk_fake(
     top_k: int = 1,
     scoring_func: str = "softmax",
     renormalize: bool = True,
+    peer_ll_buffers: torch.Tensor | None = None,
+    residual_in: torch.Tensor | None = None,
+    rms_gamma: torch.Tensor | None = None,
+    rms_eps: float = 0.0,
+    ll_flag: int = 0,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> torch.Tensor:
     return torch.empty_like(activations_in)
 
