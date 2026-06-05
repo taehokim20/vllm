@@ -440,11 +440,13 @@ __device__ void moe_kernel_topk_BS8(
 
   if (down_group_r == 0) {
     if (tp_size > 1 && peer_ll_buffers != nullptr) {
-      // ── Fused AR (LL protocol) + residual + RMSNorm ──────────────────
-      phase5_fused_ar_ll<Dims>(spec, activations_out, residual_in, rms_gamma,
-                               rms_eps, peer_ll_buffers, ll_flag, tp_rank,
-                               tp_size, batch_size, base_col_r,
-                               DOWN_COL_TILE_LOCAL);
+      // ── Fused AR (LL protocol) — all-reduce only ──────────────────
+      // Replaces NCCL all-reduce. Output is the sum of all ranks' partials.
+      // Residual and RMSNorm remain as separate ops outside the kernel.
+      phase5_ar_only_ll<Dims>(spec, activations_out,
+                              peer_ll_buffers, ll_flag, tp_rank,
+                              tp_size, batch_size, base_col_r,
+                              DOWN_COL_TILE_LOCAL);
     } else {
       // ── Original Phase 5: plain fp32 → bf16 cast (tp_size == 1) ────
       for (std::uint32_t flat = threadIdx.x;

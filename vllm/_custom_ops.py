@@ -341,26 +341,24 @@ def moe_monokernel_topk(
             with contextlib.suppress(AttributeError, RuntimeError):
                 expert_weights_up._tma_interleaved_up_v2 = up_interleaved
 
-        torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(
-            activations_in,
-            router_logits,
-            up_interleaved,
-            expert_scales_up,
-            expert_weights_down,
-            expert_scales_down,
-            activations_out,
-            scratchpad,
-            top_k,
-            scoring_func_int,
-            renormalize,
-            peer_ll_buffers,
-            residual_in,
-            rms_gamma,
-            rms_eps,
-            ll_flag,
-            tp_rank,
-            tp_size,
+        # Dispatch to the appropriate TP variant based on tp_size.
+        # TP>1 variants have N sharded (N/tp_size), requiring all-reduce after.
+        _kernel_args = (
+            activations_in, router_logits, up_interleaved, expert_scales_up,
+            expert_weights_down, expert_scales_down, activations_out, scratchpad,
+            top_k, scoring_func_int, renormalize,
+            peer_ll_buffers, residual_in, rms_gamma, rms_eps,
+            ll_flag, tp_rank, tp_size,
         )
+        if tp_size == 2:
+            torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2(*_kernel_args)
+        elif tp_size == 4:
+            torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP4(*_kernel_args)
+        elif tp_size == 8:
+            torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP8(*_kernel_args)
+        else:
+            # TP=1 or unsupported — use the original kernel
+            torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(*_kernel_args)
     else:
         torch.ops._moe_C.moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8(
             activations_in,

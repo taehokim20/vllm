@@ -904,6 +904,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w13_weight.device
             )
 
+            # Setup LL workspace for fused AR when tp_size > 1
+            from vllm.distributed.parallel_state import (
+                get_tensor_model_parallel_world_size,
+                get_tensor_model_parallel_rank,
+            )
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                from vllm.distributed.moe_ll_workspace import MoELLWorkspace
+                from vllm.distributed.parallel_state import get_tp_group
+                self._moe_ll_workspace = MoELLWorkspace(
+                    max_num_tokens=8,  # BS=8
+                    hidden_dim=2048,   # K
+                    tp_group=get_tp_group().device_group,
+                )
+                self._moe_tp_size = tp_size
+                self._moe_tp_rank = get_tensor_model_parallel_rank()
+            else:
+                self._moe_ll_workspace = None
+                self._moe_tp_size = 1
+                self._moe_tp_rank = 0
+
     def maybe_make_prepare_finalize(
         self,
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
@@ -1029,6 +1050,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 top_k = layer.top_k
                 scoring_func = getattr(layer, "scoring_func", "softmax")
                 renormalize = getattr(layer, "renormalize", True)
+
+                # Fused AR params (None/0/1 when tp_size=1)
+                ll_workspace = getattr(self, "_moe_ll_workspace", None)
+                peer_ll_buffers = ll_workspace.peer_ll_buffers if ll_workspace else None
+                ll_flag = ll_workspace.next_flag() if ll_workspace else 0
+                _tp_rank = getattr(self, "_moe_tp_rank", 0)
+                _tp_size = getattr(self, "_moe_tp_size", 1)
+
                 return torch.ops.vllm.moe_monokernel_topk(
                     x,
                     router_logits,
@@ -1040,6 +1069,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     top_k,
                     scoring_func,
                     renormalize,
+                    peer_ll_buffers,
+                    None,   # residual_in (not fused yet)
+                    None,   # rms_gamma (not fused yet)
+                    0.0,    # rms_eps
+                    ll_flag,
+                    _tp_rank,
+                    _tp_size,
                 )
             # Fall back to the modular kernel for large batches.
             return self._apply_modular_fallback(layer, x, router_logits)

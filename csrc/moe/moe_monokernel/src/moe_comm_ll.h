@@ -95,6 +95,118 @@ __device__ __forceinline__ float ll_warp_reduce_sum(float val) {
 }
 
 // ============================================================================
+// AR-only Phase 5: storeLL + readLL + reduce (no residual, no RMSNorm)
+//
+// Minimal version that replaces NCCL all-reduce. Output is the sum of all
+// ranks' down_partial_out, cast to bf16. Residual and RMSNorm remain as
+// separate ops outside the kernel.
+// ============================================================================
+
+/**
+ * @brief All-reduce only via LL protocol for one block's column stripe.
+ *
+ * Each block:
+ *   1. Casts its fp32 partial to bf16 and sends via storeLL to all peers
+ *   2. Reads peer contributions via readLL
+ *   3. Sums local + all peers and writes bf16 to activations_out
+ */
+template <typename Dims>
+__device__ void phase5_ar_only_ll(
+    MoEGemmSpec<Dims>* __restrict__ spec,
+    R_element* __restrict__ activations_out,
+    void** __restrict__ peer_ll_buffers, uint32_t ll_flag,
+    uint32_t tp_rank, uint32_t tp_size, uint32_t batch_size,
+    uint32_t base_col, uint32_t col_tile) {
+  const uint32_t packets_per_stripe = col_tile / LL_ELEMS_PER_PACKET;
+  const uint32_t packets_per_row = Dims::HIDDEN_STATES / LL_ELEMS_PER_PACKET;
+  const uint32_t pkt_offset = base_col / LL_ELEMS_PER_PACKET;
+
+  // ── Step 1: cast fp32 → bf16 and storeLL to all peers ──
+  for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;
+       flat += blockDim.x) {
+    const uint32_t tok = flat / packets_per_stripe;
+    const uint32_t pkt_in_stripe = flat % packets_per_stripe;
+    const uint32_t col = base_col + pkt_in_stripe * LL_ELEMS_PER_PACKET;
+
+    __nv_bfloat16 bf16_vals[LL_ELEMS_PER_PACKET];
+#pragma unroll
+    for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
+      float v = spec->down_partial_out[tok * Dims::HIDDEN_STATES + col + i];
+      bf16_vals[i] = (__nv_bfloat16)v;
+    }
+
+    uint64_t payload;
+    memcpy(&payload, bf16_vals, sizeof(uint64_t));
+
+    const uint32_t ll_idx =
+        tp_rank * batch_size * packets_per_row +
+        tok * packets_per_row + pkt_offset + pkt_in_stripe;
+
+    for (uint32_t peer = 0; peer < tp_size; ++peer) {
+      if (peer == tp_rank) continue;
+      LLPacket* peer_buf = reinterpret_cast<LLPacket*>(peer_ll_buffers[peer]);
+      storeLL(&peer_buf[ll_idx], payload, ll_flag);
+    }
+  }
+
+  // Ensure stores are visible before reads
+  __threadfence_system();
+
+  // ── Step 2: readLL from peers + reduce + write ──
+  for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;
+       flat += blockDim.x) {
+    const uint32_t tok = flat / packets_per_stripe;
+    const uint32_t pkt_in_stripe = flat % packets_per_stripe;
+    const uint32_t col = base_col + pkt_in_stripe * LL_ELEMS_PER_PACKET;
+
+    // Start with local partial (fp32 for precision)
+    float vals[LL_ELEMS_PER_PACKET];
+#pragma unroll
+    for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
+      vals[i] = spec->down_partial_out[tok * Dims::HIDDEN_STATES + col + i];
+    }
+
+    // Add peer contributions
+    for (uint32_t peer = 0; peer < tp_size; ++peer) {
+      if (peer == tp_rank) continue;
+      LLPacket* my_buf = reinterpret_cast<LLPacket*>(peer_ll_buffers[tp_rank]);
+      const uint32_t peer_ll_idx =
+          peer * batch_size * packets_per_row +
+          tok * packets_per_row + pkt_offset + pkt_in_stripe;
+      uint64_t peer_data = readLL(&my_buf[peer_ll_idx], ll_flag);
+
+      __nv_bfloat16 peer_bf16[LL_ELEMS_PER_PACKET];
+      memcpy(peer_bf16, &peer_data, sizeof(uint64_t));
+#pragma unroll
+      for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
+        vals[i] += (float)peer_bf16[i];
+      }
+    }
+
+    // Write reduced result as bf16
+    const uint32_t elem_offset = tok * Dims::HIDDEN_STATES + col;
+#pragma unroll
+    for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
+      activations_out[elem_offset + i] = (R_element)vals[i];
+    }
+  }
+
+  // Zero padding rows [batch_size, Dims::BS)
+  for (uint32_t flat = threadIdx.x;
+       flat < (Dims::BS - batch_size) * packets_per_stripe;
+       flat += blockDim.x) {
+    const uint32_t tok = batch_size + flat / packets_per_stripe;
+    const uint32_t pkt_in_stripe = flat % packets_per_stripe;
+    const uint32_t col = base_col + pkt_in_stripe * LL_ELEMS_PER_PACKET;
+    const uint32_t elem_offset = tok * Dims::HIDDEN_STATES + col;
+#pragma unroll
+    for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
+      activations_out[elem_offset + i] = (R_element)0.0f;
+    }
+  }
+}
+
+// ============================================================================
 // Fused Phase 5: storeLL + readLL + reduce + residual + RMSNorm
 //
 // Replaces the simple fp32→bf16 cast in Phase 5 when tp_size > 1.

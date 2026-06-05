@@ -163,6 +163,97 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA {
   };
 };
 
+// TP=2 variant: N is halved (512/2 = 256). Each rank computes a partial
+// [tokens, K=2048] output from its N/2 input slice; all-reduce sums them.
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2 {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 256;  // 512 / 2
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 4
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 2
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    static constexpr bool USE_TMA = true;
+    static constexpr std::uint32_t K_STEP_DOWN = 256;
+    static constexpr std::uint32_t K_STEP_UP = 256;
+    static constexpr bool USE_PAIR_LAYOUT = true;
+  };
+};
+
+// TP=4 variant: N is quartered (512/4 = 128).
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP4 {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 128;  // 512 / 4
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 2
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 1
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    static constexpr bool USE_TMA = true;
+    static constexpr std::uint32_t K_STEP_DOWN = 128;  // N=128, so K_STEP_DOWN <= N
+    static constexpr std::uint32_t K_STEP_UP = 256;
+    static constexpr bool USE_PAIR_LAYOUT = true;
+  };
+};
+
+// TP=8 variant: N is divided by 8 (512/8 = 64).
+struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP8 {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 64;  // 512 / 8
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 1
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 1
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    static constexpr bool USE_TMA = true;
+    static constexpr std::uint32_t K_STEP_DOWN = 64;  // N=64, so K_STEP_DOWN <= N
+    static constexpr std::uint32_t K_STEP_UP = 256;
+    static constexpr bool USE_PAIR_LAYOUT = true;
+  };
+};
+
 // Scoring function enum for routing
 enum class ScoringFunc : uint32_t {
   SIGMOID = 0,
@@ -227,7 +318,15 @@ __global__ extern void moe_kernel_topk(
     __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
-    __grid_constant__ CUtensorMap const down_activations_desc);
+    __grid_constant__ CUtensorMap const down_activations_desc,
+    // Fused AR + residual + RMSNorm parameters
+    void** __restrict__ peer_ll_buffers,
+    const R_element* __restrict__ residual_in,
+    const R_element* __restrict__ rms_gamma,
+    float rms_eps,
+    std::uint32_t ll_flag,
+    std::uint32_t tp_rank,
+    std::uint32_t tp_size);
 
 }  // namespace moe_monokernel
 
