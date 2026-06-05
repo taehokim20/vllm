@@ -328,8 +328,3 @@ MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP4_impl,
     moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP4)
-
-// TP=8 variant (N=64, sharded down-proj input dim)
-MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
-    moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP8_impl,
-    moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP8)

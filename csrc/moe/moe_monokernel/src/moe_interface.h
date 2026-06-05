@@ -218,41 +218,14 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP4 {
     static constexpr std::uint32_t BLOCK_SIZE = 384;
     static constexpr bool USE_WGMMA = true;
     static constexpr bool USE_TMA = true;
-    static constexpr std::uint32_t K_STEP_DOWN = 128;  // N=128, so K_STEP_DOWN <= N
+    static constexpr std::uint32_t K_STEP_DOWN = 128;  // must be multiple of 128
     static constexpr std::uint32_t K_STEP_UP = 256;
     static constexpr bool USE_PAIR_LAYOUT = true;
   };
 };
 
-// TP=8 variant: N is divided by 8 (512/8 = 64).
-struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP8 {
-  static constexpr uint32_t HIDDEN_STATES = 2048;
-  static constexpr uint32_t K = 2048;
-  static constexpr uint32_t N = 64;  // 512 / 8
-  static constexpr uint32_t BS = 8;
-  static constexpr uint32_t M = 8;
-  static constexpr uint32_t NUM_EXPERTS = 256;
-  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
-  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
-  static constexpr uint32_t BLOCK_SCALE_COL = 128;
-  static constexpr uint32_t UP_SCALE_ROWS =
-      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 1
-  static constexpr uint32_t UP_SCALE_COLS =
-      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
-  static constexpr uint32_t DOWN_SCALE_ROWS =
-      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
-  static constexpr uint32_t DOWN_SCALE_COLS =
-      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 1
-  struct KernelConfig {
-    static constexpr std::uint32_t GRID_SIZE = 128;
-    static constexpr std::uint32_t BLOCK_SIZE = 384;
-    static constexpr bool USE_WGMMA = true;
-    static constexpr bool USE_TMA = true;
-    static constexpr std::uint32_t K_STEP_DOWN = 64;  // N=64, so K_STEP_DOWN <= N
-    static constexpr std::uint32_t K_STEP_UP = 256;
-    static constexpr bool USE_PAIR_LAYOUT = true;
-  };
-};
+// Note: TP=8 (N=64) is too narrow for WGMMA tiling (K_STEP_DOWN=128 > N=64).
+// Only TP=2 and TP=4 are supported.
 
 // Scoring function enum for routing
 enum class ScoringFunc : uint32_t {
