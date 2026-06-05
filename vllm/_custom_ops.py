@@ -352,8 +352,6 @@ def moe_monokernel_topk(
         )
         if tp_size == 2:
             torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2(*_kernel_args)
-        elif tp_size == 4:
-            torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP4(*_kernel_args)
         else:
             # TP=1 or unsupported — use the original kernel
             torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA(*_kernel_args)

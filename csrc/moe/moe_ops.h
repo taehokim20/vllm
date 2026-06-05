@@ -111,19 +111,6 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2_impl(
     const std::optional<torch::Tensor>& residual_in,
     const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
     int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
-// TP=4 variant (N=128)
-void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP4_impl(
-    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
-    const torch::Tensor& expert_weights_up,
-    const torch::Tensor& expert_scales_up,
-    const torch::Tensor& expert_weights_down,
-    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
-    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
-    bool renormalize,
-    const std::optional<torch::Tensor>& peer_ll_buffers,
-    const std::optional<torch::Tensor>& residual_in,
-    const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
-    int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
 #endif
 
 #ifndef USE_ROCM
