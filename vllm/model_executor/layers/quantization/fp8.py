@@ -868,7 +868,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and self.block_quant
             and self.fp8_backend == Fp8MoeBackend.TRITON
             and getattr(layer, "global_num_experts", 0) == 256
-            and layer.w13_weight.size(1) == 1024
+            and (layer.w13_weight.size(1) == 1024  # TP=1: 2*N=1024
+                 or layer.w13_weight.size(1) == 512)  # TP=2: 2*(N/2)=512
             and layer.w13_weight.size(2) == 2048
             and getattr(layer, "top_k", 1) > 1
         )

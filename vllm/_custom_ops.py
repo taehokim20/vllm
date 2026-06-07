@@ -314,9 +314,9 @@ def moe_monokernel_topk(
 
     # Dispatch to Qwen3.5-35B FP8 block-wise kernel (E=256, N=1024, K=2048, TP=1)
     # N here is the fused gate+up dim = 2 * moe_intermediate_size (2*512=1024).
-    assert E == 256 and N == 1024 and K == 2048, (
+    assert E == 256 and K == 2048 and (N == 1024 or N == 512), (
         f"moe_monokernel_topk: unsupported dims E={E}, N={N}, K={K}. "
-        "Supported: E=256 N=1024 K=2048 (Qwen3.5-35B block-wise FP8)."
+        "Supported: E=256 K=2048, N=1024 (TP=1) or N=512 (TP=2)."
     )
     if M <= 8:
         # BS8 uses the TMA+WGMMA Pair_Layout (V2) kernel with
