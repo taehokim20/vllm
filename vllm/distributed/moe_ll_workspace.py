@@ -152,26 +152,27 @@ class MoELLWorkspace:
             self._setup_vmm()
 
     def _setup_vmm(self) -> None:
-        """Setup cross-process access using CUDA VMM (cuMemCreate/cuMemMap).
-        
+        """Setup cross-process access using CUDA VMM + Unix socket fd passing.
+
         Each rank:
         1. Allocates physical memory with cuMemCreate
         2. Exports a shareable POSIX fd with cuMemExportToShareableHandle
-        3. Exchanges fds via a shared file in /dev/shm
+        3. Exchanges fds via Unix domain sockets (SCM_RIGHTS)
         4. Imports peer handles and maps them into local VA space
         5. Grants read/write access to all peer GPUs
         """
         import ctypes
         import struct
-        import tempfile
-        import mmap as mmap_mod
+        import socket
+        import array
+        import os
 
         cuda = ctypes.CDLL("libcuda.so")
+        cudart = ctypes.CDLL("libcudart.so")
 
         # Type aliases
         CUdeviceptr = ctypes.c_uint64
         CUmemGenericAllocationHandle = ctypes.c_uint64
-        CUdevice = ctypes.c_int
 
         # Constants
         CU_MEM_ALLOCATION_TYPE_PINNED = 1
@@ -179,7 +180,6 @@ class MoELLWorkspace:
         CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1
         CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
 
-        # Get allocation granularity
         class CUmemAllocationProp(ctypes.Structure):
             _fields_ = [
                 ("type", ctypes.c_int),
@@ -190,69 +190,6 @@ class MoELLWorkspace:
                 ("reserved", ctypes.c_uint64 * 4),
             ]
 
-        local_device = torch.cuda.current_device()
-        prop = CUmemAllocationProp()
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        prop.location_type = CU_MEM_LOCATION_TYPE_DEVICE
-        prop.location_id = local_device
-
-        granularity = ctypes.c_size_t()
-        cuda.cuMemGetAllocationGranularity.restype = ctypes.c_int
-        cuda.cuMemGetAllocationGranularity.argtypes = [
-            ctypes.POINTER(ctypes.c_size_t),
-            ctypes.POINTER(CUmemAllocationProp),
-            ctypes.c_int,  # CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
-        ]
-        err = cuda.cuMemGetAllocationGranularity(
-            ctypes.byref(granularity), ctypes.byref(prop), 0
-        )
-        if err != 0:
-            raise RuntimeError(f"cuMemGetAllocationGranularity failed: {err}")
-
-        # Round up buffer size to granularity
-        alloc_size = ((self.buffer_size_bytes + granularity.value - 1)
-                      // granularity.value * granularity.value)
-
-        # Allocate physical memory
-        cuda.cuMemCreate.restype = ctypes.c_int
-        cuda.cuMemCreate.argtypes = [
-            ctypes.POINTER(CUmemGenericAllocationHandle),
-            ctypes.c_size_t,
-            ctypes.POINTER(CUmemAllocationProp),
-            ctypes.c_uint64,
-        ]
-        local_handle = CUmemGenericAllocationHandle()
-        err = cuda.cuMemCreate(
-            ctypes.byref(local_handle), alloc_size, ctypes.byref(prop), 0
-        )
-        if err != 0:
-            raise RuntimeError(f"cuMemCreate failed: {err}")
-
-        # Reserve virtual address space
-        cuda.cuMemAddressReserve.restype = ctypes.c_int
-        cuda.cuMemAddressReserve.argtypes = [
-            ctypes.POINTER(CUdeviceptr), ctypes.c_size_t,
-            ctypes.c_size_t, CUdeviceptr, ctypes.c_uint64,
-        ]
-        local_va = CUdeviceptr()
-        err = cuda.cuMemAddressReserve(
-            ctypes.byref(local_va), alloc_size, granularity.value, 0, 0
-        )
-        if err != 0:
-            raise RuntimeError(f"cuMemAddressReserve failed: {err}")
-
-        # Map physical memory to virtual address
-        cuda.cuMemMap.restype = ctypes.c_int
-        cuda.cuMemMap.argtypes = [
-            CUdeviceptr, ctypes.c_size_t, ctypes.c_size_t,
-            CUmemGenericAllocationHandle, ctypes.c_uint64,
-        ]
-        err = cuda.cuMemMap(local_va, alloc_size, 0, local_handle, 0)
-        if err != 0:
-            raise RuntimeError(f"cuMemMap failed: {err}")
-
-        # Set access for all devices
         class CUmemAccessDesc(ctypes.Structure):
             _fields_ = [
                 ("location_type", ctypes.c_int),
@@ -260,31 +197,84 @@ class MoELLWorkspace:
                 ("flags", ctypes.c_int),
             ]
 
+        # Setup function signatures
+        cuda.cuMemGetAllocationGranularity.restype = ctypes.c_int
+        cuda.cuMemGetAllocationGranularity.argtypes = [
+            ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(CUmemAllocationProp), ctypes.c_int
+        ]
+        cuda.cuMemCreate.restype = ctypes.c_int
+        cuda.cuMemCreate.argtypes = [
+            ctypes.POINTER(CUmemGenericAllocationHandle), ctypes.c_size_t,
+            ctypes.POINTER(CUmemAllocationProp), ctypes.c_uint64
+        ]
+        cuda.cuMemAddressReserve.restype = ctypes.c_int
+        cuda.cuMemAddressReserve.argtypes = [
+            ctypes.POINTER(CUdeviceptr), ctypes.c_size_t, ctypes.c_size_t,
+            CUdeviceptr, ctypes.c_uint64
+        ]
+        cuda.cuMemMap.restype = ctypes.c_int
+        cuda.cuMemMap.argtypes = [
+            CUdeviceptr, ctypes.c_size_t, ctypes.c_size_t,
+            CUmemGenericAllocationHandle, ctypes.c_uint64
+        ]
         cuda.cuMemSetAccess.restype = ctypes.c_int
         cuda.cuMemSetAccess.argtypes = [
-            CUdeviceptr, ctypes.c_size_t,
-            ctypes.POINTER(CUmemAccessDesc), ctypes.c_size_t,
+            CUdeviceptr, ctypes.c_size_t, ctypes.POINTER(CUmemAccessDesc), ctypes.c_size_t
         ]
-        # Grant access to all GPUs
+        cuda.cuMemExportToShareableHandle.restype = ctypes.c_int
+        cuda.cuMemExportToShareableHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_int), CUmemGenericAllocationHandle,
+            ctypes.c_int, ctypes.c_uint64
+        ]
+        cuda.cuMemImportFromShareableHandle.restype = ctypes.c_int
+        cuda.cuMemImportFromShareableHandle.argtypes = [
+            ctypes.POINTER(CUmemGenericAllocationHandle), ctypes.c_int, ctypes.c_int
+        ]
+
+        local_device = torch.cuda.current_device()
+
+        # Get granularity
+        prop = CUmemAllocationProp()
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        prop.location_type = CU_MEM_LOCATION_TYPE_DEVICE
+        prop.location_id = local_device
+
+        granularity = ctypes.c_size_t()
+        err = cuda.cuMemGetAllocationGranularity(ctypes.byref(granularity), ctypes.byref(prop), 0)
+        if err != 0:
+            raise RuntimeError(f"cuMemGetAllocationGranularity failed: {err}")
+
+        # Round up buffer size
+        alloc_size = ((self.buffer_size_bytes + granularity.value - 1)
+                      // granularity.value * granularity.value)
+
+        # Create physical memory
+        local_handle = CUmemGenericAllocationHandle()
+        err = cuda.cuMemCreate(ctypes.byref(local_handle), alloc_size, ctypes.byref(prop), 0)
+        if err != 0:
+            raise RuntimeError(f"cuMemCreate failed: {err}")
+
+        # Reserve VA and map
+        local_va = CUdeviceptr()
+        err = cuda.cuMemAddressReserve(ctypes.byref(local_va), alloc_size, granularity.value, 0, 0)
+        if err != 0:
+            raise RuntimeError(f"cuMemAddressReserve failed: {err}")
+        err = cuda.cuMemMap(local_va, alloc_size, 0, local_handle, 0)
+        if err != 0:
+            raise RuntimeError(f"cuMemMap failed: {err}")
+
+        # Set access for all GPUs
         access_descs = (CUmemAccessDesc * self.tp_size)()
         for i in range(self.tp_size):
             access_descs[i].location_type = CU_MEM_LOCATION_TYPE_DEVICE
             access_descs[i].location_id = i
             access_descs[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        err = cuda.cuMemSetAccess(
-            local_va, alloc_size, access_descs, self.tp_size
-        )
+        err = cuda.cuMemSetAccess(local_va, alloc_size, access_descs, self.tp_size)
         if err != 0:
             raise RuntimeError(f"cuMemSetAccess failed: {err}")
 
-        # Export shareable handle (POSIX fd)
-        cuda.cuMemExportToShareableHandle.restype = ctypes.c_int
-        cuda.cuMemExportToShareableHandle.argtypes = [
-            ctypes.POINTER(ctypes.c_int),
-            CUmemGenericAllocationHandle,
-            ctypes.c_int,
-            ctypes.c_uint64,
-        ]
+        # Export shareable fd
         local_fd = ctypes.c_int()
         err = cuda.cuMemExportToShareableHandle(
             ctypes.byref(local_fd), local_handle,
@@ -293,82 +283,103 @@ class MoELLWorkspace:
         if err != 0:
             raise RuntimeError(f"cuMemExportToShareableHandle failed: {err}")
 
-        # Exchange fds via /dev/shm files
-        shm_path = f"/dev/shm/moe_ll_rank{self.tp_rank}"
-        with open(shm_path, "wb") as f:
-            # Write: fd number, alloc_size, VA pointer
-            f.write(struct.pack("iqQ", local_fd.value, alloc_size, local_va.value))
+        # Zero the buffer
+        cudart.cudaMemset.restype = ctypes.c_int
+        cudart.cudaMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        cudart.cudaMemset(ctypes.c_void_p(local_va.value), 0, alloc_size)
+        torch.cuda.synchronize()
 
-        # Barrier to ensure all ranks have written their shm files
+        # ── Exchange fds via Unix domain sockets (SCM_RIGHTS) ──
+        # For each pair (i, j) where i < j, rank i is server, rank j is client.
+        # Each pair exchanges fds bidirectionally.
+        peer_fds = {}  # peer_rank -> received fd
+
+        for peer in range(self.tp_size):
+            if peer == self.tp_rank:
+                continue
+            sock_path = f"/dev/shm/moe_ll_sock_{min(self.tp_rank, peer)}_{max(self.tp_rank, peer)}"
+
+            if self.tp_rank < peer:
+                # Server
+                if os.path.exists(sock_path):
+                    os.remove(sock_path)
+                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                server.bind(sock_path)
+                server.listen(1)
+                dist.barrier(group=self.tp_group)
+                conn, _ = server.accept()
+                # Send our fd
+                fds = array.array("i", [local_fd.value])
+                conn.sendmsg(
+                    [struct.pack("q", alloc_size)],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)]
+                )
+                # Receive peer's fd
+                msg, ancdata, _, _ = conn.recvmsg(8, socket.CMSG_SPACE(4))
+                for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                    if cmsg_type == socket.SCM_RIGHTS:
+                        peer_fds[peer] = array.array("i", cmsg_data)[0]
+                conn.close()
+                server.close()
+                os.remove(sock_path)
+            else:
+                # Client
+                dist.barrier(group=self.tp_group)
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.connect(sock_path)
+                # Receive peer's fd
+                msg, ancdata, _, _ = client.recvmsg(8, socket.CMSG_SPACE(4))
+                for cmsg_level, cmsg_type, cmsg_data in ancdata:
+                    if cmsg_type == socket.SCM_RIGHTS:
+                        peer_fds[peer] = array.array("i", cmsg_data)[0]
+                # Send our fd
+                fds = array.array("i", [local_fd.value])
+                client.sendmsg(
+                    [struct.pack("q", alloc_size)],
+                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)]
+                )
+                client.close()
+
         dist.barrier(group=self.tp_group)
 
-        # Read peer info and import their handles
+        # ── Import peer handles and map into local VA ──
         self._peer_buffers = []
         self._vmm_handles = [local_handle]
         self._vmm_vas = [local_va.value]
-
-        cuda.cuMemImportFromShareableHandle.restype = ctypes.c_int
-        cuda.cuMemImportFromShareableHandle.argtypes = [
-            ctypes.POINTER(CUmemGenericAllocationHandle),
-            ctypes.c_int,
-            ctypes.c_int,
-        ]
 
         for i in range(self.tp_size):
             if i == self.tp_rank:
                 self._peer_buffers.append(local_va.value)
             else:
-                peer_shm = f"/dev/shm/moe_ll_rank{i}"
-                with open(peer_shm, "rb") as f:
-                    peer_fd, peer_size, peer_va = struct.unpack("iqQ", f.read())
-
-                # Import peer's handle
                 peer_handle = CUmemGenericAllocationHandle()
                 err = cuda.cuMemImportFromShareableHandle(
-                    ctypes.byref(peer_handle), peer_fd,
-                    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR,
+                    ctypes.byref(peer_handle), peer_fds[i],
+                    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
                 )
                 if err != 0:
-                    raise RuntimeError(
-                        f"cuMemImportFromShareableHandle for rank {i} failed: {err}"
-                    )
+                    raise RuntimeError(f"cuMemImportFromShareableHandle for rank {i} failed: {err}")
 
-                # Reserve VA for peer's memory
-                peer_local_va = CUdeviceptr()
+                peer_va = CUdeviceptr()
                 err = cuda.cuMemAddressReserve(
-                    ctypes.byref(peer_local_va), peer_size,
-                    granularity.value, 0, 0
+                    ctypes.byref(peer_va), alloc_size, granularity.value, 0, 0
                 )
                 if err != 0:
                     raise RuntimeError(f"cuMemAddressReserve for peer {i} failed: {err}")
 
-                # Map peer's physical memory into our VA
-                err = cuda.cuMemMap(peer_local_va, peer_size, 0, peer_handle, 0)
+                err = cuda.cuMemMap(peer_va, alloc_size, 0, peer_handle, 0)
                 if err != 0:
                     raise RuntimeError(f"cuMemMap for peer {i} failed: {err}")
 
-                # Set access
-                err = cuda.cuMemSetAccess(
-                    peer_local_va, peer_size, access_descs, self.tp_size
-                )
+                err = cuda.cuMemSetAccess(peer_va, alloc_size, access_descs, self.tp_size)
                 if err != 0:
                     raise RuntimeError(f"cuMemSetAccess for peer {i} failed: {err}")
 
-                self._peer_buffers.append(peer_local_va.value)
+                self._peer_buffers.append(peer_va.value)
                 self._vmm_handles.append(peer_handle)
-                self._vmm_vas.append(peer_local_va.value)
+                self._vmm_vas.append(peer_va.value)
 
-        # Override _local_buffer to use the VMM-allocated memory
-        # (the original torch.zeros buffer is no longer used for the LL protocol)
-        self._vmm_local_va = local_va.value
+        # Override local buffer pointer to use VMM-allocated memory
         self._vmm_alloc_size = alloc_size
-
-        # Zero the VMM buffer
-        import ctypes as ct
-        cudart = ct.CDLL("libcudart.so")
-        cudart.cudaMemset.restype = ct.c_int
-        cudart.cudaMemset.argtypes = [ct.c_void_p, ct.c_int, ct.c_size_t]
-        cudart.cudaMemset(ct.c_void_p(local_va.value), 0, alloc_size)
 
         dist.barrier(group=self.tp_group)
 
