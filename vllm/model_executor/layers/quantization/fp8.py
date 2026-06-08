@@ -1053,11 +1053,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 renormalize = getattr(layer, "renormalize", True)
 
                 # Fused AR params (None/0/1 when tp_size=1)
-                ll_workspace = getattr(self, "_moe_ll_workspace", None)
+                # Lazy init: create LL workspace on first forward call
+                # (avoids segfault during model load when TP group isn't ready)
+                if not hasattr(self, "_moe_ll_workspace"):
+                    from vllm.distributed.parallel_state import (
+                        get_tensor_model_parallel_world_size,
+                        get_tensor_model_parallel_rank,
+                    )
+                    tp_size = get_tensor_model_parallel_world_size()
+                    self._moe_tp_size = tp_size
+                    self._moe_tp_rank = get_tensor_model_parallel_rank()
+                    if tp_size > 1:
+                        from vllm.distributed.moe_ll_workspace import MoELLWorkspace
+                        from vllm.distributed.parallel_state import get_tp_group
+                        self._moe_ll_workspace = MoELLWorkspace(
+                            max_num_tokens=8,
+                            hidden_dim=2048,
+                            tp_group=get_tp_group().device_group,
+                        )
+                    else:
+                        self._moe_ll_workspace = None
+
+                ll_workspace = self._moe_ll_workspace
                 peer_ll_buffers = ll_workspace.peer_ll_buffers if ll_workspace else None
                 ll_flag = ll_workspace.next_flag() if ll_workspace else 0
-                _tp_rank = getattr(self, "_moe_tp_rank", 0)
-                _tp_size = getattr(self, "_moe_tp_size", 1)
+                _tp_rank = self._moe_tp_rank
+                _tp_size = self._moe_tp_size
 
                 return torch.ops.vllm.moe_monokernel_topk(
                     x,
