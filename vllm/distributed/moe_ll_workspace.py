@@ -129,10 +129,14 @@ class MoELLWorkspace:
             cudart = ctypes.CDLL("libcudart.so")
             cudart.cudaDeviceEnablePeerAccess.restype = ctypes.c_int
             cudart.cudaDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
+            cudart.cudaGetLastError.restype = ctypes.c_int
+            cudart.cudaGetLastError.argtypes = []
             local_device = torch.cuda.current_device()
             for peer in range(self.tp_size):
                 if peer != local_device:
-                    cudart.cudaDeviceEnablePeerAccess(peer, 0)
+                    err = cudart.cudaDeviceEnablePeerAccess(peer, 0)
+                    if err == 704:  # cudaErrorPeerAccessAlreadyEnabled
+                        cudart.cudaGetLastError()  # Clear the error state
 
             local_ptr_tensor = torch.tensor(
                 [self._local_buffer.data_ptr()], dtype=torch.int64, device="cuda"
