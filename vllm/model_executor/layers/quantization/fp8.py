@@ -906,25 +906,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
 
             # Setup LL workspace for fused AR when tp_size > 1
-            from vllm.distributed.parallel_state import (
-                get_tensor_model_parallel_world_size,
-                get_tensor_model_parallel_rank,
-            )
-            tp_size = get_tensor_model_parallel_world_size()
-            if tp_size > 1:
-                from vllm.distributed.moe_ll_workspace import MoELLWorkspace
-                from vllm.distributed.parallel_state import get_tp_group
-                self._moe_ll_workspace = MoELLWorkspace(
-                    max_num_tokens=8,  # BS=8
-                    hidden_dim=2048,   # K
-                    tp_group=get_tp_group().device_group,
+            # Only initialized if VLLM_MOE_FUSED_AR=1 is set
+            import os
+            if os.environ.get("VLLM_MOE_FUSED_AR") == "1":
+                from vllm.distributed.parallel_state import (
+                    get_tensor_model_parallel_world_size,
+                    get_tensor_model_parallel_rank,
                 )
-                self._moe_tp_size = tp_size
-                self._moe_tp_rank = get_tensor_model_parallel_rank()
-            else:
-                self._moe_ll_workspace = None
-                self._moe_tp_size = 1
-                self._moe_tp_rank = 0
+                tp_size = get_tensor_model_parallel_world_size()
+                if tp_size > 1:
+                    from vllm.distributed.moe_ll_workspace import MoELLWorkspace
+                    from vllm.distributed.parallel_state import get_tp_group
+                    self._moe_ll_workspace = MoELLWorkspace(
+                        max_num_tokens=256,  # Must cover max cudagraph_capture_size
+                        hidden_dim=2048,
+                        tp_group=get_tp_group().device_group,
+                    )
+                    self._moe_tp_size = tp_size
+                    self._moe_tp_rank = get_tensor_model_parallel_rank()
+                else:
+                    self._moe_ll_workspace = None
+                    self._moe_tp_size = 1
+                    self._moe_tp_rank = 0
 
     def maybe_make_prepare_finalize(
         self,
@@ -1052,18 +1055,24 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scoring_func = getattr(layer, "scoring_func", "softmax")
                 renormalize = getattr(layer, "renormalize", True)
 
-                # Fused AR params (None/0/1 when tp_size=1)
-                # NOTE: LL workspace disabled for multi-process TP (deadlocks).
-                # The kernel takes the original bf16 cast path when
-                # peer_ll_buffers is None.
+                # Fused AR params
                 from vllm.distributed.parallel_state import (
                     get_tensor_model_parallel_world_size,
                     get_tensor_model_parallel_rank,
                 )
                 _tp_size = get_tensor_model_parallel_world_size()
                 _tp_rank = get_tensor_model_parallel_rank()
+
                 peer_ll_buffers = None
                 ll_flag = 0
+                if hasattr(self, "_moe_ll_workspace") and self._moe_ll_workspace is not None:
+                    peer_ll_buffers = self._moe_ll_workspace.peer_ll_buffers
+                    ll_flag = self._moe_ll_workspace.next_flag()
+                    # The kernel's fused AR already all-reduced the output.
+                    # Tell the runner to skip the external NCCL all-reduce.
+                    self._fused_ar_did_reduce = True
+                else:
+                    self._fused_ar_did_reduce = False
 
                 return torch.ops.vllm.moe_monokernel_topk(
                     x,
@@ -1085,6 +1094,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     _tp_size,
                 )
             # Fall back to the modular kernel for large batches.
+            self._fused_ar_did_reduce = False
             return self._apply_modular_fallback(layer, x, router_logits)
 
         assert self.moe_kernel is not None

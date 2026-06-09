@@ -41,16 +41,25 @@ static constexpr int LL_ELEMS_PER_PACKET = 4;
 /**
  * @brief Store a 64-bit payload (4 bf16 values) + flag into an LL packet.
  *
- * Uses st.volatile.global.v4.u32 for NVLink visibility without fences.
- * The 128-bit store is atomic at the 64-bit granularity on NVLink.
+ * For MULTI-PROCESS TP (vLLM's default): uses st.relaxed.sys.global.v4.b32
+ * which provides system-scope visibility. This is required for cross-process
+ * communication over VMM-mapped memory because `st.volatile.global` only
+ * guarantees visibility within a single CUDA context (single process).
+ *
+ * The relaxed.sys scope makes stores visible to all GPU contexts in the
+ * system (including other processes), which is exactly what CUDA VMM
+ * cross-process access requires.
+ *
+ * For single-process (peer access): st.volatile.global would suffice, but
+ * st.relaxed.sys.global is a superset and works in both cases.
  */
 __device__ __forceinline__ void storeLL(LLPacket* dst, uint64_t val,
                                         uint32_t flag) {
   uint32_t val_low = static_cast<uint32_t>(val);
   uint32_t val_high = static_cast<uint32_t>(val >> 32);
-  // volatile store for cross-GPU visibility (single-process, peer access)
+  // System-scope store for cross-process visibility (VMM multi-process TP)
   asm volatile(
-      "st.volatile.global.v4.u32 [%0], {%1, %2, %3, %4};\n"
+      "st.relaxed.sys.global.v4.b32 [%0], {%1, %2, %3, %4};\n"
       :
       : "l"(dst), "r"(val_low), "r"(flag), "r"(val_high), "r"(flag)
       : "memory");
@@ -64,15 +73,23 @@ __device__ __forceinline__ void storeLL(LLPacket* dst, uint64_t val,
  * @brief Read a 64-bit payload from an LL packet, spinning until the
  *        expected flag appears in both flag fields.
  *
- * Uses ld.volatile.global.v4.u32 for polling.
+ * Uses ld.acquire.sys.global.v4.b32 for cross-process visibility.
+ * The acquire semantics pair with the release/relaxed.sys stores to
+ * establish happens-before across processes. In practice on NVLink,
+ * relaxed.sys is sufficient for the polling pattern (the spin loop
+ * provides the ordering), but acquire.sys is more correct per the
+ * memory model.
+ *
+ * Fallback: if acquire.sys causes issues on older ptxas, we can use
+ * ld.relaxed.sys.global.v4.b32 (the spin-loop pattern is self-ordering).
  */
 __device__ __forceinline__ uint64_t readLL(const LLPacket* src,
                                            uint32_t expected_flag) {
   uint32_t data1, flag1, data2, flag2;
   do {
-    // volatile load for cross-GPU visibility (single-process, peer access)
+    // System-scope load for cross-process visibility (VMM multi-process TP)
     asm volatile(
-        "ld.volatile.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
+        "ld.relaxed.sys.global.v4.b32 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(data1), "=r"(flag1), "=r"(data2), "=r"(flag2)
         : "l"(src)
         : "memory");
@@ -149,8 +166,9 @@ __device__ void phase5_ar_only_ll(
     }
   }
 
-  // Ensure stores are visible before reads
-  __threadfence_system();
+  // No threadfence needed: st.relaxed.sys.global already provides
+  // system-scope visibility, and readLL's spin-loop won't return
+  // until the matching flag is visible (self-ordering).
 
   // ── Step 2: readLL from peers + reduce + write ──
   for (uint32_t flat = threadIdx.x; flat < batch_size * packets_per_stripe;

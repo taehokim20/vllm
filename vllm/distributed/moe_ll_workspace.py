@@ -122,7 +122,14 @@ class MoELLWorkspace:
         import ctypes
         import os
 
-        is_multiprocess = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+        # Detect multi-process TP: if ranks are in different PIDs, we need
+        # VMM for cross-process kernel access. Check by gathering PIDs.
+        local_pid = torch.tensor([os.getpid()], dtype=torch.int64, device="cuda")
+        all_pids = [torch.zeros(1, dtype=torch.int64, device="cuda")
+                    for _ in range(self.tp_size)]
+        dist.all_gather(all_pids, local_pid, group=self.tp_group)
+        pids = [t.item() for t in all_pids]
+        is_multiprocess = len(set(pids)) > 1  # Different PIDs = different processes
 
         if not is_multiprocess:
             # Single-process multi-GPU: raw pointers with peer access

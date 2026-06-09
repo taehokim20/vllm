@@ -329,6 +329,10 @@ class MoERunner(MoERunnerInterface):
 
     @property
     def _fused_output_is_reduced(self) -> bool:
+        # Check if the monokernel's fused AR already all-reduced the output.
+        # This flag is set per-invocation in Fp8MoEMethod.apply_monolithic.
+        if getattr(self.quant_method, "_fused_ar_did_reduce", False):
+            return True
         return (
             self.quant_method.moe_kernel is not None
             and self.quant_method.moe_kernel.output_is_reduced()
