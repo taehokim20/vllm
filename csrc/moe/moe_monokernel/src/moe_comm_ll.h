@@ -236,7 +236,10 @@ __device__ void phase5_ar_only_ll(
  *        column stripe.
  *
  * @param spec            Scratchpad (reads down_partial_out)
- * @param activations_out Output buffer [BS, HIDDEN_STATES] bf16 — final result
+ * @param activations_out Output buffer [BS, HIDDEN_STATES] bf16 — RMSNorm'd result
+ * @param residual_out    Output buffer [BS, HIDDEN_STATES] bf16 — pre-norm residual
+ *                        (= all_reduce(partial) + residual_in). This becomes the
+ *                        next layer's residual input.
  * @param residual_in     Residual from previous layer [BS, HIDDEN_STATES] bf16
  * @param rms_gamma       RMSNorm weight [HIDDEN_STATES] bf16
  * @param rms_eps         RMSNorm epsilon
@@ -252,6 +255,7 @@ template <typename Dims>
 __device__ void phase5_fused_ar_ll(
     MoEGemmSpec<Dims>* __restrict__ spec,
     R_element* __restrict__ activations_out,
+    R_element* __restrict__ residual_out,
     const R_element* __restrict__ residual_in,
     const R_element* __restrict__ rms_gamma, float rms_eps,
     void** __restrict__ peer_ll_buffers, uint32_t ll_flag,
@@ -309,8 +313,9 @@ __device__ void phase5_fused_ar_ll(
     }
   }
 
-  // Ensure all storeLL writes are visible to other GPUs (system-scope fence)
-  __threadfence_system();
+  // No threadfence needed: st.relaxed.sys.global already provides
+  // system-scope visibility, and readLL's spin-loop won't return
+  // until the matching flag is visible (self-ordering).
 
   // ── Step B: readLL + reduce + residual + RMSNorm ───────────────────
   //
@@ -375,11 +380,12 @@ __device__ void phase5_fused_ar_ll(
     }
 
     // Write pre-norm result to activations_out (will be overwritten in B3
-    // with the normed value). Also write to residual_out if provided
-    // (the pre-norm value IS the updated residual for the next layer).
+    // with the normed value). Also write to residual_out — the pre-norm
+    // value IS the updated residual for the next layer.
 #pragma unroll
     for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
       activations_out[elem_offset + i] = (R_element)vals[i];
+      residual_out[elem_offset + i] = (R_element)vals[i];
     }
   }
 
@@ -482,6 +488,7 @@ __device__ void phase5_fused_ar_ll(
 #pragma unroll
     for (int i = 0; i < LL_ELEMS_PER_PACKET; ++i) {
       activations_out[elem_offset + i] = (R_element)0.0f;
+      residual_out[elem_offset + i] = (R_element)0.0f;
     }
   }
 }

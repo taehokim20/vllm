@@ -1087,6 +1087,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     renormalize,
                     peer_ll_buffers,
                     None,   # residual_in (not fused yet)
+                    None,   # residual_out (not fused yet)
                     None,   # rms_gamma (not fused yet)
                     0.0,    # rms_eps
                     ll_flag,

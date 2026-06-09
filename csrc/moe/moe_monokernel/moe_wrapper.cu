@@ -66,6 +66,7 @@ static_assert(
             int64_t top_k, int64_t scoring_func, bool renormalize,             \
             const std::optional<torch::Tensor>& peer_ll_buffers_opt,           \
             const std::optional<torch::Tensor>& residual_in_opt,               \
+            const std::optional<torch::Tensor>& residual_out_opt,              \
             const std::optional<torch::Tensor>& rms_gamma_opt,                 \
             double rms_eps_dbl,                                                \
             int64_t ll_flag_i64, int64_t tp_rank_i64, int64_t tp_size_i64) {   \
@@ -127,6 +128,10 @@ static_assert(
     const at::BFloat16* residual_in_ptr =                                      \
         residual_in_opt.has_value()                                            \
             ? residual_in_opt.value().data_ptr<at::BFloat16>()                 \
+            : nullptr;                                                         \
+    at::BFloat16* residual_out_ptr =                                           \
+        residual_out_opt.has_value()                                           \
+            ? residual_out_opt.value().data_ptr<at::BFloat16>()                \
             : nullptr;                                                         \
     const at::BFloat16* rms_gamma_ptr =                                        \
         rms_gamma_opt.has_value()                                              \
@@ -203,6 +208,7 @@ static_assert(
                            (void*)&down_activations_desc,                      \
                            (void*)&peer_ll_buffers_ptr,                        \
                            (void*)&residual_in_ptr,                            \
+                           (void*)&residual_out_ptr,                           \
                            (void*)&rms_gamma_ptr,                              \
                            (void*)&rms_eps_f,                                  \
                            (void*)&ll_flag_u32,                                \

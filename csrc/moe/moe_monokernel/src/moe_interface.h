@@ -266,6 +266,7 @@ __global__ extern void moe_kernel_topk(
     // Fused AR + residual + RMSNorm parameters
     void** __restrict__ peer_ll_buffers,
     const R_element* __restrict__ residual_in,
+    R_element* __restrict__ residual_out,
     const R_element* __restrict__ rms_gamma,
     float rms_eps,
     std::uint32_t ll_flag,

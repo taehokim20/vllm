@@ -79,6 +79,7 @@ void moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl(
     bool renormalize,
     const std::optional<torch::Tensor>& peer_ll_buffers,
     const std::optional<torch::Tensor>& residual_in,
+    const std::optional<torch::Tensor>& residual_out,
     const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
     int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
 // Pair_Layout V2 of the BS8 TMA + WGMMA path
@@ -96,6 +97,7 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl(
     bool renormalize,
     const std::optional<torch::Tensor>& peer_ll_buffers,
     const std::optional<torch::Tensor>& residual_in,
+    const std::optional<torch::Tensor>& residual_out,
     const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
     int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
 // TP=2 variant (N=256)
@@ -109,6 +111,7 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2_impl(
     bool renormalize,
     const std::optional<torch::Tensor>& peer_ll_buffers,
     const std::optional<torch::Tensor>& residual_in,
+    const std::optional<torch::Tensor>& residual_out,
     const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
     int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
 #endif

@@ -220,6 +220,7 @@ def moe_monokernel_topk(
     # Fused AR + residual + RMSNorm parameters (Plan 1)
     peer_ll_buffers: torch.Tensor | None = None,
     residual_in: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
     rms_gamma: torch.Tensor | None = None,
     rms_eps: float = 0.0,
     ll_flag: int = 0,
@@ -347,7 +348,7 @@ def moe_monokernel_topk(
             activations_in, router_logits, up_interleaved, expert_scales_up,
             expert_weights_down, expert_scales_down, activations_out, scratchpad,
             top_k, scoring_func_int, renormalize,
-            peer_ll_buffers, residual_in, rms_gamma, rms_eps,
+            peer_ll_buffers, residual_in, residual_out, rms_gamma, rms_eps,
             ll_flag, tp_rank, tp_size,
         )
         if tp_size == 2:
@@ -370,6 +371,7 @@ def moe_monokernel_topk(
             renormalize,
             peer_ll_buffers,
             residual_in,
+            residual_out,
             rms_gamma,
             rms_eps,
             ll_flag,
@@ -393,6 +395,7 @@ def moe_monokernel_topk_fake(
     renormalize: bool = True,
     peer_ll_buffers: torch.Tensor | None = None,
     residual_in: torch.Tensor | None = None,
+    residual_out: torch.Tensor | None = None,
     rms_gamma: torch.Tensor | None = None,
     rms_eps: float = 0.0,
     ll_flag: int = 0,

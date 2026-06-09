@@ -50,6 +50,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor! activations_out, Tensor! scratchpad,"
       "int top_k, int scoring_func, bool renormalize,"
       "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? residual_out,"
       "Tensor? rms_gamma, float rms_eps,"
       "int ll_flag, int tp_rank, int tp_size) -> ()");
   m.impl("moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
@@ -72,6 +73,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor! activations_out, Tensor! scratchpad,"
       "int top_k, int scoring_func, bool renormalize,"
       "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? residual_out,"
       "Tensor? rms_gamma, float rms_eps,"
       "int ll_flag, int tp_rank, int tp_size) -> ()");
   m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
@@ -88,6 +90,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor! activations_out, Tensor! scratchpad,"
       "int top_k, int scoring_func, bool renormalize,"
       "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? residual_out,"
       "Tensor? rms_gamma, float rms_eps,"
       "int ll_flag, int tp_rank, int tp_size) -> ()");
   m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2",
