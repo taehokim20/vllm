@@ -420,7 +420,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        if residual is None:
+        # Check if previous layer's fused AR already did our input_layernorm
+        if getattr(self, "_skip_input_layernorm", False):
+            # hidden_states is already normalized; residual is the pre-norm value.
+            # Reset the flag for next forward pass.
+            self._skip_input_layernorm = False
+        elif residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
@@ -432,6 +437,35 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # If fused AR+residual+RMSNorm is available, pass residual and
+        # next-layer norm weight via side-channel so the monokernel can
+        # do everything in one kernel launch.
+        _next_norm_weight = getattr(self, "_next_layernorm_weight", None)
+        if _next_norm_weight is not None:
+            import os
+            if os.environ.get("VLLM_MOE_FUSED_AR") == "1":
+                from vllm.model_executor.layers.fused_moe.monokernel_fused_norm import (
+                    set_fused_norm_inputs,
+                    get_fused_norm_residual_out,
+                    clear_fused_norm,
+                    did_fuse,
+                )
+                set_fused_norm_inputs(
+                    residual, _next_norm_weight, self._next_layernorm_eps
+                )
+                hidden_states = self.mlp(hidden_states)
+                if did_fuse():
+                    new_residual = get_fused_norm_residual_out()
+                    clear_fused_norm()
+                    # Signal next layer to skip its input_layernorm
+                    if hasattr(self, "_next_layer_ref") and self._next_layer_ref is not None:
+                        self._next_layer_ref._skip_input_layernorm = True
+                    return hidden_states, new_residual
+                clear_fused_norm()
+                # Fallback: kernel didn't fuse (e.g., M > 8), proceed normally
+                return hidden_states, residual
+
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -471,6 +505,22 @@ class Qwen3MoeModel(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
+
+        # Wire next-layer norm weights for fused AR+residual+RMSNorm.
+        # Each MoE layer gets a reference to the NEXT layer's input_layernorm
+        # weight so the monokernel can fuse the norm into its Phase 5.
+        # NOTE: We skip the last layer — it would fuse model.norm which
+        # complicates the final-output path (prefill fallback needs norm).
+        import os
+        if os.environ.get("VLLM_MOE_FUSED_AR") == "1":
+            for i in range(len(self.layers) - 1):
+                curr_layer = self.layers[i]
+                next_layer = self.layers[i + 1]
+                if (hasattr(curr_layer, 'mlp')
+                    and isinstance(curr_layer.mlp, Qwen3MoeSparseMoeBlock)):
+                    curr_layer._next_layernorm_weight = next_layer.input_layernorm.weight
+                    curr_layer._next_layernorm_eps = config.rms_norm_eps
+                    curr_layer._next_layer_ref = next_layer
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)

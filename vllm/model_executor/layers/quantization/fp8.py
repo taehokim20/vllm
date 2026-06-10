@@ -1074,6 +1074,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 else:
                     self._fused_ar_did_reduce = False
 
+                # Check if fused residual+RMSNorm is available via side-channel
+                from vllm.model_executor.layers.fused_moe.monokernel_fused_norm import (
+                    get_fused_norm_inputs,
+                    mark_fused,
+                )
+                residual_in, residual_out, rms_gamma, rms_eps = get_fused_norm_inputs()
+                # Mark fusion if all inputs are available
+                if residual_in is not None and rms_gamma is not None:
+                    mark_fused()
+
                 return torch.ops.vllm.moe_monokernel_topk(
                     x,
                     router_logits,
@@ -1086,10 +1096,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     scoring_func,
                     renormalize,
                     peer_ll_buffers,
-                    None,   # residual_in (not fused yet)
-                    None,   # residual_out (not fused yet)
-                    None,   # rms_gamma (not fused yet)
-                    0.0,    # rms_eps
+                    residual_in,
+                    residual_out,
+                    rms_gamma,
+                    rms_eps if rms_eps else 0.0,
                     ll_flag,
                     _tp_rank,
                     _tp_size,
