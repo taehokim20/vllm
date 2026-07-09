@@ -72,7 +72,14 @@ __device__ void moe_kernel_topk_BS8(
     const R_element* __restrict__ residual_in,
     R_element* __restrict__ residual_out,
     const R_element* __restrict__ rms_gamma,
-    float rms_eps, uint32_t ll_flag, uint32_t tp_rank, uint32_t tp_size) {
+    float rms_eps, uint32_t ll_flag, uint32_t tp_rank, uint32_t tp_size,
+    uint32_t expert_base,
+    // EP dispatch overlap: peer activation buffer + this rank's owned token
+    // range. When peer_activations != nullptr, routing_phase_quantize peer-
+    // reads remote tokens' rows (folded into the quantize) instead of relying
+    // on a prologue staging copy. nullptr/0/0 => original behavior.
+    const A_element* __restrict__ peer_activations = nullptr,
+    uint32_t local_token_start = 0u, uint32_t n_local_tokens = 0u) {
   static_assert(Dims::BS <= 8);
   static_assert(use_wgmma<Dims>::value,
                 "BS8 path requires the WGMMA configuration (use_wgmma).");
@@ -264,7 +271,7 @@ __device__ void moe_kernel_topk_BS8(
   // `experts[]`/`sorted_slot[]`/...; warps 1..11 write
   // `fp8_act_full`/`act_scale`).
   if (warp_id == 0) {
-    prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec);
+    prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec, expert_base);
   } else {
 #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     uint32_t parity_rwin = 0;
@@ -273,7 +280,9 @@ __device__ void moe_kernel_topk_BS8(
 #endif
 #ifndef MONO_PROFILE_SKIP_CALC_UP
     routing_phase_quantize<Dims>(u_tma->bf16_in_full, u_tma->fp8_act_full,
-                                 shmem->act_scale, batch_size);
+                                 shmem->act_scale, batch_size,
+                                 peer_activations, local_token_start,
+                                 local_token_start + n_local_tokens);
 #endif
   }
   __syncthreads();
@@ -440,7 +449,12 @@ __device__ void moe_kernel_topk_BS8(
   const std::uint32_t base_col_r = down_block_idx_r * DOWN_COL_TILE_LOCAL;
 
   if (down_group_r == 0) {
-    if (tp_size > 1 && peer_ll_buffers != nullptr) {
+    // EP variant: Phase 5 always does the plain partial cast — the per-rank
+    // partial is combined across ranks externally (not all-reduced here).
+    // `peer_ll_buffers` for the EP kernel is used only for the dispatch
+    // readiness handshake, NOT for a TP all-reduce, so the AR path must be
+    // excluded for is_ep<Dims> even though peer_ll_buffers/tp_size are set.
+    if (!is_ep<Dims>::value && tp_size > 1 && peer_ll_buffers != nullptr) {
       if (residual_in != nullptr && rms_gamma != nullptr) {
         // ── Fused AR + Residual + RMSNorm (full fusion) ─────────────
         // Single kernel: all-reduce + residual add + RMSNorm.
@@ -591,7 +605,21 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
     float rms_eps,
     std::uint32_t ll_flag,
     std::uint32_t tp_rank,
-    std::uint32_t tp_size) {
+    std::uint32_t tp_size,
+    // EP: first global expert id owned by this rank (0 for non-EP). Only
+    // consumed when `is_ep<Dims>` (the local-expert filter in
+    // prepare_moe_topk_BS8); ignored otherwise.
+    std::uint32_t expert_base,
+    // EP dispatch (Milestone 2b, v1-simple): in-kernel peer-read of remote
+    // token activations. `peer_activations` points at the peer rank's
+    // [BS, HIDDEN_STATES] bf16 activation buffer (indexed by GLOBAL token
+    // row), reachable via VMM / peer access. Token rows in
+    // [local_token_start, local_token_start + n_local_tokens) are owned
+    // locally; all other rows are peer-read from `peer_activations` before
+    // the activation TMA runs. nullptr / non-EP => no dispatch (no-op).
+    const A_element* __restrict__ peer_activations,
+    std::uint32_t local_token_start,
+    std::uint32_t n_local_tokens) {
   // ── Compile-time preconditions on `Dims` (spec R7.3, R11.3) ─────────────
   // These fire at the first point where `Dims` is instantiated, so any
   // misconfigured variant is caught at compile time before any TMA /
@@ -647,6 +675,12 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
   assert(token_count > 0);
   assert(top_k >= 1 && top_k <= MoE_SHM<Dims>::MAX_TOPK);
 
+  // `expert_base` is consumed only by the BS8 EP filter (forwarded into
+  // moe_kernel_topk_BS8 below under `if constexpr (Dims::BS <= 8)`); the
+  // BS64 instantiations never read it. Void it here so non-EP / BS64
+  // builds don't trip -Wunused-parameter under -Werror.
+  (void)expert_base;
+
   MoEGemmSpec<Dims>* spec = reinterpret_cast<MoEGemmSpec<Dims>*>(scratchpad);
 
   extern __shared__ char shmem_buffer[];
@@ -689,6 +723,72 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
   uint32_t colstripe_phase = 0;
   constexpr uint32_t GRID_SIZE_STATIC = Dims::KernelConfig::GRID_SIZE;
 
+  // ── EP dispatch prologue (Milestone 2b, v1-simple) ───────────────────
+  // Assemble the global activation tile in place: peer-read the REMOTE
+  // token rows (those outside this rank's owned block) from the peer's
+  // activation buffer into our own `activations_in`, then grid-sync so the
+  // writes are visible before the activation TMA in Phase 1 reads them.
+  // The entire downstream pipeline (TMA -> route -> up/down -> Phase 5) is
+  // unchanged; this is the correctness-first version (the receive is NOT
+  // yet overlapped with compute — that's the next refinement).
+  //
+  // Gated by `is_ep<Dims>` (compiled out for non-EP variants -> byte-
+  // identical) and by a runtime `peer_activations != nullptr` (so the EP
+  // op without a peer buffer, e.g. the M1/M2a partial tests, still runs the
+  // plain local-expert path).
+  if constexpr (is_ep<Dims>::value) {
+    if (peer_activations != nullptr) {
+      // ── (c) Cross-rank readiness handshake ───────────────────────────
+      // Ensure the PEER has written this layer's input (i.e. entered its MoE
+      // kernel, after its previous-layer writes) before we peer-read it.
+      // Reuses the LL flag buffers: this rank publishes ll_flag into its own
+      // slot (peer_ll_buffers[tp_rank]) after a system fence, then spins until
+      // the peer's slot (peer_ll_buffers[peer]) reaches ll_flag. `ll_flag` is
+      // the per-layer value (identical on both ranks under DP lockstep).
+      //
+      // Gated on peer_ll_buffers != nullptr: the pre-staged microbenchmarks
+      // (M2a/M2b) don't pass it and skip the handshake. NOTE: when enabled,
+      // ranks MUST run concurrently (each waits on the other) — a sequential
+      // launch without the peer's flag pre-set would spin forever.
+      if (peer_ll_buffers != nullptr) {
+        const uint32_t peer = (tp_size >= 2u) ? (tp_rank ^ 1u) : tp_rank;
+        uint32_t* my_flag =
+            reinterpret_cast<uint32_t*>(peer_ll_buffers[tp_rank]);
+        uint32_t* peer_flag =
+            reinterpret_cast<uint32_t*>(peer_ll_buffers[peer]);
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+          // Publish our layer-input writes system-wide, then raise our flag.
+          __threadfence_system();
+          asm volatile("st.relaxed.sys.global.b32 [%0], %1;\n"
+                       : : "l"(my_flag), "r"(ll_flag) : "memory");
+        }
+        if (threadIdx.x == 0) {
+          uint32_t f;
+          do {
+            asm volatile("ld.relaxed.sys.global.b32 %0, [%1];\n"
+                         : "=r"(f) : "l"(peer_flag) : "memory");
+          } while (f != ll_flag);
+        }
+        __syncthreads();  // all threads of the block wait for readiness
+      }
+
+      // ── OVERLAP (Stage 2): the remote-token peer-read is NO LONGER done
+      // here as a separate global staging copy + grid_barrier. Instead it is
+      // FOLDED into routing_phase_quantize (Phase 2): each owning warp peer-
+      // reads its remote (token, kblk) row from `peer_activations` straight
+      // into `bf16_in_full` right before quantizing it, so the receive
+      // overlaps warp-0 routing and we drop a full grid sync + a redundant
+      // global round-trip. The readiness handshake above still orders the
+      // peer's write before our read (when peer_ll_buffers is provided; the
+      // real DP path instead orders via the router all-gather barrier issued
+      // before the kernel launch). Nothing to do in the prologue now.
+    }
+  } else {
+    (void)peer_activations;
+    (void)local_token_start;
+    (void)n_local_tokens;
+  }
+
   // Site #1 — top-of-kernel output zero-out + sync.
   //
   // For BS8 (TMA+WGMMA): ELIMINATED. The Phase 5 reduction in
@@ -718,7 +818,8 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
         down_activations_desc, grid_counters, grid_phase, expert_counters,
         expert_phase, colstripe_counters, colstripe_phase,
         peer_ll_buffers, residual_in, residual_out, rms_gamma, rms_eps,
-        ll_flag, tp_rank, tp_size);
+        ll_flag, tp_rank, tp_size, expert_base,
+        peer_activations, local_token_start, n_local_tokens);
   } else {
     moe_kernel_topk_BS64<Dims>(
         activations_in, token_count, router_logits, expert_weights_up,

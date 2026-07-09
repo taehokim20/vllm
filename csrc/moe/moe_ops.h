@@ -81,7 +81,9 @@ void moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl(
     const std::optional<torch::Tensor>& residual_in,
     const std::optional<torch::Tensor>& residual_out,
     const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
-    int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
+    int64_t ll_flag, int64_t tp_rank, int64_t tp_size, int64_t expert_base,
+    const std::optional<torch::Tensor>& peer_activations,
+    int64_t local_token_start, int64_t n_local_tokens);
 // Pair_Layout V2 of the BS8 TMA + WGMMA path
 // (`up-proj-gate-up-pair-layout` spec R9.4).  This is the only BS8 TMA
 // implementation: TMA-based weight + activation load, 4-deep weight TMA
@@ -99,7 +101,9 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl(
     const std::optional<torch::Tensor>& residual_in,
     const std::optional<torch::Tensor>& residual_out,
     const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
-    int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
+    int64_t ll_flag, int64_t tp_rank, int64_t tp_size, int64_t expert_base,
+    const std::optional<torch::Tensor>& peer_activations,
+    int64_t local_token_start, int64_t n_local_tokens);
 // TP=2 variant (N=256)
 void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2_impl(
     const torch::Tensor& activations_in, const torch::Tensor& router_logits,
@@ -113,7 +117,25 @@ void moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2_impl(
     const std::optional<torch::Tensor>& residual_in,
     const std::optional<torch::Tensor>& residual_out,
     const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
-    int64_t ll_flag, int64_t tp_rank, int64_t tp_size);
+    int64_t ll_flag, int64_t tp_rank, int64_t tp_size, int64_t expert_base,
+    const std::optional<torch::Tensor>& peer_activations,
+    int64_t local_token_start, int64_t n_local_tokens);
+// EP variant (Milestone 1): local-expert slice via runtime expert_base.
+void moe_monokernel_topk_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP_impl(
+    const torch::Tensor& activations_in, const torch::Tensor& router_logits,
+    const torch::Tensor& expert_weights_up,
+    const torch::Tensor& expert_scales_up,
+    const torch::Tensor& expert_weights_down,
+    const torch::Tensor& expert_scales_down, torch::Tensor& activations_out,
+    torch::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
+    bool renormalize,
+    const std::optional<torch::Tensor>& peer_ll_buffers,
+    const std::optional<torch::Tensor>& residual_in,
+    const std::optional<torch::Tensor>& residual_out,
+    const std::optional<torch::Tensor>& rms_gamma, double rms_eps,
+    int64_t ll_flag, int64_t tp_rank, int64_t tp_size, int64_t expert_base,
+    const std::optional<torch::Tensor>& peer_activations,
+    int64_t local_token_start, int64_t n_local_tokens);
 #endif
 
 #ifndef USE_ROCM

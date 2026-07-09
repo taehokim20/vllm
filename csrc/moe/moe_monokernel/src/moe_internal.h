@@ -191,6 +191,48 @@ struct use_pair_layout {
   static constexpr bool value = test<Dims>(0);
 };
 
+// ── EP (expert-parallel) opt-in detection ──────────────────────────────
+// `Dims::KernelConfig::IS_EP` is optional; defaults to false so every
+// existing (non-EP) Dims variant compiles byte-identically — the EP filter
+// in `prepare_moe_topk_BS8` is guarded by `if constexpr (is_ep<Dims>::value)`
+// and collapses to nothing for them.  Only the EP Dims variant
+// (`Dims_BS8_E128_..._EP`) sets IS_EP=true, enabling the local-expert filter.
+template <typename Dims>
+struct is_ep {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::IS_EP, bool()) {
+    return D::KernelConfig::IS_EP;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
+// ── Local-expert count for EP variants ──────────────────────────────────
+// `Dims::NUM_LOCAL_EXPERTS` is optional; defaults to `Dims::NUM_EXPERTS`
+// (= all experts local, i.e. non-EP).  For EP, NUM_EXPERTS stays the GLOBAL
+// expert count (256, used for routing / router_logits width / barrier
+// sizing) while NUM_LOCAL_EXPERTS is the per-rank slice (e.g. 128 at EP=2).
+template <typename Dims>
+struct num_local_experts {
+ private:
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype((std::uint32_t)D::NUM_LOCAL_EXPERTS) {
+    return (std::uint32_t)D::NUM_LOCAL_EXPERTS;
+  }
+  template <typename>
+  static constexpr std::uint32_t test(...) {
+    return (std::uint32_t)Dims::NUM_EXPERTS;
+  }
+
+ public:
+  static constexpr std::uint32_t value = test<Dims>(0);
+};
+
 // ── Down-proj K-step size opt-in detection ──────────────────────────────
 // `Dims::KernelConfig::K_STEP_DOWN` is optional; default to 128 (= the
 // up-proj K_STEP_WGMMA, which also matches the SWZ128 atom width).  Set

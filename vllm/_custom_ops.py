@@ -226,6 +226,11 @@ def moe_monokernel_topk(
     ll_flag: int = 0,
     tp_rank: int = 0,
     tp_size: int = 1,
+    expert_base: int = 0,
+    ep: bool = False,
+    peer_activations: torch.Tensor | None = None,
+    local_token_start: int = 0,
+    n_local_tokens: int = 0,
 ) -> torch.Tensor:
     """MoE monokernel with configurable top-K routing, scoring function,
     and renormalization.
@@ -274,31 +279,37 @@ def moe_monokernel_topk(
         MOE_SCORING_SOFTMAX if scoring_func == "softmax" else MOE_SCORING_SIGMOID
     )
 
-    E = router_logits.size(1)
+    E = router_logits.size(1)  # GLOBAL expert count (routing width)
     M = activations_in.size(0)
     # Derive N and K from actual tensor shapes — works for any model/TP config
     N = expert_weights_up.size(1)  # gate+up fused: 2*N_half
     K = expert_weights_up.size(2)  # hidden states
+    # Local expert count = weight tensor's leading dim. For non-EP this equals
+    # E (the rank holds all experts); for EP it is the per-rank slice (e.g.
+    # 128 at EP=2), while routing still sees all E global experts.
+    E_local = expert_weights_up.size(0)
 
     assert router_logits.size() == (M, E), f"size is: {router_logits.size()}"
-    assert expert_weights_up.size() == (E, N, K), f"size is: {expert_weights_up.size()}"
-    assert expert_weights_down.size() == (E, K, N // 2), (
+    assert expert_weights_up.size() == (E_local, N, K), (
+        f"size is: {expert_weights_up.size()}"
+    )
+    assert expert_weights_down.size() == (E_local, K, N // 2), (
         f"size is: {expert_weights_down.size()}"
     )
 
-    # Scale shapes: block-wise (128×128) → [E, ceil(rows/128), ceil(cols/128)]
+    # Scale shapes: block-wise (128×128) → [E_local, ceil(rows/128), ceil(cols/128)]
     N_half = N // 2
     up_scale_rows = (N + 127) // 128  # ceil(2*N_half / 128)
     up_scale_cols = (K + 127) // 128  # ceil(K / 128)
     down_scale_rows = (K + 127) // 128  # ceil(K / 128)
     down_scale_cols = (N_half + 127) // 128  # ceil(N_half / 128)
-    assert expert_scales_up.size() == (E, up_scale_rows, up_scale_cols), (
+    assert expert_scales_up.size() == (E_local, up_scale_rows, up_scale_cols), (
         f"expert_scales_up size is: {expert_scales_up.size()}, "
-        f"expected: ({E}, {up_scale_rows}, {up_scale_cols})"
+        f"expected: ({E_local}, {up_scale_rows}, {up_scale_cols})"
     )
-    assert expert_scales_down.size() == (E, down_scale_rows, down_scale_cols), (
+    assert expert_scales_down.size() == (E_local, down_scale_rows, down_scale_cols), (
         f"expert_scales_down size is: {expert_scales_down.size()}, "
-        f"expected: ({E}, {down_scale_rows}, {down_scale_cols})"
+        f"expected: ({E_local}, {down_scale_rows}, {down_scale_cols})"
     )
 
     assert activations_in.dtype is torch.bfloat16
@@ -349,9 +360,14 @@ def moe_monokernel_topk(
             expert_weights_down, expert_scales_down, activations_out, scratchpad,
             top_k, scoring_func_int, renormalize,
             peer_ll_buffers, residual_in, residual_out, rms_gamma, rms_eps,
-            ll_flag, tp_rank, tp_size,
+            ll_flag, tp_rank, tp_size, expert_base,
+            peer_activations, local_token_start, n_local_tokens,
         )
-        if tp_size == 2:
+        if ep:
+            # EP: same global weights [256, ...], but each rank computes only
+            # experts [expert_base, expert_base + 128) and emits a partial.
+            torch.ops._moe_C.moe_monokernel_topk_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP(*_kernel_args)
+        elif tp_size == 2:
             torch.ops._moe_C.moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2(*_kernel_args)
         else:
             # TP=1 or unsupported — use the original kernel
@@ -377,6 +393,10 @@ def moe_monokernel_topk(
             ll_flag,
             tp_rank,
             tp_size,
+            expert_base,
+            peer_activations,
+            local_token_start,
+            n_local_tokens,
         )
 
     return activations_out
@@ -401,6 +421,11 @@ def moe_monokernel_topk_fake(
     ll_flag: int = 0,
     tp_rank: int = 0,
     tp_size: int = 1,
+    expert_base: int = 0,
+    ep: bool = False,
+    peer_activations: torch.Tensor | None = None,
+    local_token_start: int = 0,
+    n_local_tokens: int = 0,
 ) -> torch.Tensor:
     return torch.empty_like(activations_in)
 

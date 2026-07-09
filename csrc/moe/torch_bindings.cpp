@@ -52,7 +52,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor? peer_ll_buffers, Tensor? residual_in,"
       "Tensor? residual_out,"
       "Tensor? rms_gamma, float rms_eps,"
-      "int ll_flag, int tp_rank, int tp_size) -> ()");
+      "int ll_flag, int tp_rank, int tp_size, int expert_base,"
+      "Tensor? peer_activations, int local_token_start, int n_local_tokens"
+      ") -> ()");
   m.impl("moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8", torch::kCUDA,
          &moe_monokernel_topk_BS64_E256_Qwen3_5_35B_BlockFP8_impl);
 
@@ -75,7 +77,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor? peer_ll_buffers, Tensor? residual_in,"
       "Tensor? residual_out,"
       "Tensor? rms_gamma, float rms_eps,"
-      "int ll_flag, int tp_rank, int tp_size) -> ()");
+      "int ll_flag, int tp_rank, int tp_size, int expert_base,"
+      "Tensor? peer_activations, int local_token_start, int n_local_tokens"
+      ") -> ()");
   m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA",
          torch::kCUDA,
          &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_impl);
@@ -92,10 +96,33 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor? peer_ll_buffers, Tensor? residual_in,"
       "Tensor? residual_out,"
       "Tensor? rms_gamma, float rms_eps,"
-      "int ll_flag, int tp_rank, int tp_size) -> ()");
+      "int ll_flag, int tp_rank, int tp_size, int expert_base,"
+      "Tensor? peer_activations, int local_token_start, int n_local_tokens"
+      ") -> ()");
   m.impl("moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2",
          torch::kCUDA,
          &moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2_impl);
+
+  // EP variant (Milestone 1): same global weights as TP=1, each rank
+  // computes only experts [expert_base, expert_base + 128) and emits a
+  // partial output.
+  m.def(
+      "moe_monokernel_topk_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP(Tensor "
+      "activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize,"
+      "Tensor? peer_ll_buffers, Tensor? residual_in,"
+      "Tensor? residual_out,"
+      "Tensor? rms_gamma, float rms_eps,"
+      "int ll_flag, int tp_rank, int tp_size, int expert_base,"
+      "Tensor? peer_activations, int local_token_start, int n_local_tokens"
+      ") -> ()");
+  m.impl("moe_monokernel_topk_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP",
+         torch::kCUDA,
+         &moe_monokernel_topk_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP_impl);
 #endif
 
   // Aligning the number of tokens to be processed by each expert such

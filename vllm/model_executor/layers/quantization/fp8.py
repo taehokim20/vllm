@@ -889,11 +889,107 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # the decode-time path becomes a cache hit with no allocation.
             # (The BS64 / prefill path uses the raw weights and needs no
             # interleave.)
-            up_interleaved = interleave_for_tma_wgmma_up_v2(
-                layer.w13_weight
-            ).contiguous()
-            with contextlib.suppress(AttributeError, RuntimeError):
-                layer.w13_weight._tma_interleaved_up_v2 = up_interleaved
+            #
+            # EP: detect expert parallelism. Under EP each rank holds only its
+            # local expert slice [128, ...]; the monokernel EP path uses
+            # global-id indexing into a [256] buffer + a routing filter that
+            # computes only this rank's experts, so below we scatter the local
+            # weights into their GLOBAL positions in a [256] buffer (rest zero,
+            # never read). The per-layer non-EP interleave is skipped under EP.
+            from vllm.distributed.parallel_state import get_ep_group
+            _ep = get_ep_group()
+            self._moe_ep_size = _ep.world_size
+            self._is_ep_monokernel = self._moe_ep_size > 1
+            if not self._is_ep_monokernel:
+                up_interleaved = interleave_for_tma_wgmma_up_v2(
+                    layer.w13_weight
+                ).contiguous()
+                with contextlib.suppress(AttributeError, RuntimeError):
+                    layer.w13_weight._tma_interleaved_up_v2 = up_interleaved
+            else:
+                # Build the global [256] weight/scale buffers with this rank's
+                # local experts at their global positions.
+                GLOBAL_E = 256
+                ep_rank = _ep.rank_in_group
+                local_E = layer.w13_weight.size(0)
+                self._moe_ep_expert_base = ep_rank * local_E
+                sname = self.weight_scale_name
+
+                def _scatter_global(local_t):
+                    g = torch.zeros(
+                        (GLOBAL_E,) + tuple(local_t.shape[1:]),
+                        dtype=local_t.dtype, device=local_t.device,
+                    )
+                    g[self._moe_ep_expert_base:
+                      self._moe_ep_expert_base + local_E] = local_t
+                    return g
+
+                self._ep_w13_global = _scatter_global(layer.w13_weight)
+                self._ep_w2_global = _scatter_global(layer.w2_weight)
+                self._ep_w13_scale_global = _scatter_global(
+                    getattr(layer, f"w13_{sname}")
+                )
+                self._ep_w2_scale_global = _scatter_global(
+                    getattr(layer, f"w2_{sname}")
+                )
+                self._ep_w13_interleaved = interleave_for_tma_wgmma_up_v2(
+                    self._ep_w13_global
+                ).contiguous()
+                # Attach as the op's interleave cache so decode-time calls are
+                # a cache hit (no per-call repack / allocation).
+                with contextlib.suppress(AttributeError, RuntimeError):
+                    self._ep_w13_global._tma_interleaved_up_v2 = (
+                        self._ep_w13_interleaved
+                    )
+
+                # ── 3a: peer-mapped activation workspace for in-kernel EP
+                # dispatch (all-to-all HIDING). Each rank writes its local
+                # hidden into this VMM-mapped buffer; peers peer-read it inside
+                # the monokernel instead of the NCCL all-gather. Reuses
+                # MoELLWorkspace's VMM cross-process peer-mapping. Opt-in via
+                # VLLM_MOE_EP_INKERNEL_DISPATCH=1 so the validated parity path
+                # (stock all-gather + monokernel compute) is unaffected. ──
+                import os as _os
+                self._ep_inkernel_dispatch = (
+                    _os.environ.get("VLLM_MOE_EP_INKERNEL_DISPATCH") == "1"
+                )
+                self._ep_act_ws = None
+                if self._ep_inkernel_dispatch:
+                    from vllm.distributed.moe_ll_workspace import MoELLWorkspace
+                    # Allocate the peer-mapped workspace ONCE and share it
+                    # across all MoE layers. process_weights_after_loading runs
+                    # per layer; allocating one MoELLWorkspace per layer would
+                    # do 40 VMM fd-exchanges over the SAME Unix-socket path with
+                    # 40 EP-group collectives, desyncing the group and hanging a
+                    # later step. Layers run sequentially, so one shared buffer
+                    # is correct. First layer allocates (lockstep on all ranks);
+                    # the rest reuse — keeping the collective count balanced.
+                    cls = type(self)
+                    if getattr(cls, "_ep_act_ws_singleton", None) is None:
+                        # Use the EP CPU (gloo) group for the IPC-handle
+                        # exchange. The handle bytes are host data, and running
+                        # this ad-hoc object collective on the NCCL device_group
+                        # (shared with vLLM's own EP collectives) mid-load can
+                        # desync that communicator and hang the first forward.
+                        # The gloo group has identical rank ordering, so kernel
+                        # peer indices are unchanged.
+                        _ep_ll_group = getattr(_ep, "cpu_group", None) or \
+                            _ep.device_group
+                        cls._ep_act_ws_singleton = MoELLWorkspace(
+                            max_num_tokens=256,
+                            hidden_dim=2048,
+                            tp_group=_ep_ll_group,
+                        )
+                    self._ep_act_ws = cls._ep_act_ws_singleton
+                    logger.info_once(
+                        "MoE monokernel EP in-kernel dispatch ENABLED "
+                        "(shared peer-mapped activation workspace)")
+                logger.info(
+                    "MoE monokernel EP path: rank %d owns experts [%d, %d) "
+                    "of %d (global [256] buffer, ~2x MoE weight memory)",
+                    ep_rank, self._moe_ep_expert_base,
+                    self._moe_ep_expert_base + local_E, GLOBAL_E,
+                )
 
             # Move the monokernel scratchpad to the weight device now, at
             # load time. Doing the host->device move lazily inside
@@ -990,6 +1086,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # shared expert execution entirely — a silent correctness bug for
         # models like Qwen3.5-35B that have shared experts.
         if getattr(self, "_use_moe_monokernel", False):
+            # OPT-IN (VLLM_MOE_EP_SHARED_OVERLAP_COMBINE=1): on the EP path the
+            # monokernel runs the shared expert ITSELF, on the aux stream,
+            # ordered after the routed monokernel so it overlaps the combine
+            # collective (NVLink/wait-bound, HBM idle) instead of contending
+            # with the HBM-bound routed compute. Reporting True makes the runner
+            # skip both its NO_OVERLAP and MULTI_STREAM_OVERLAPPED shared-expert
+            # calls; apply_monolithic stores the result into
+            # layer.shared_experts._output for the runner to pick up. Only valid
+            # on the EP monokernel path (which always takes the EP branch), so
+            # the shared expert is guaranteed to be computed there.
+            import os as _os_mko
+            if (
+                _os_mko.environ.get("VLLM_MOE_EP_SHARED_OVERLAP_COMBINE") == "1"
+                and getattr(self, "_is_ep_monokernel", False)
+            ):
+                return True
             return False
         return super().mk_owns_shared_expert
 
@@ -1045,6 +1157,361 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # N=1024, K=2048, top_k>1). The kernel only supports M<=64; larger
         # batches (e.g. prefill) fall back to the modular kernel.
         if getattr(self, "_use_moe_monokernel", False):
+            # ── EP path: the monokernel computes this rank's local expert
+            # slice over the globally-gathered token tile and emits a per-rank
+            # PARTIAL; the reduce-scatter combine sums the partials back to each
+            # rank's own tokens. Uses the global [256] weight buffer built at
+            # load time.
+            #
+            # We run the monokernel for the WHOLE tile (prefill AND decode) by
+            # CHUNKING the gathered tokens into <=8-token groups (the validated
+            # BS8 EP kernel). We do NOT use the modular Triton fallback under
+            # EP: with the monokernel OFF we verified stock Triton FP8-blockwise
+            # EP is INCORRECT for this model (garbage generation), while the
+            # FI-CUTLASS EP backend is coherent — but FI-CUTLASS repacks the
+            # weights, breaking the monokernel's raw-layout assumption. So the
+            # only correct route that keeps the raw Triton layout is to run the
+            # monokernel itself for every M. The per-<=8-chunk partial is the
+            # exact op validated in tests/moe/test_ep_realpath_weightprep.py.
+            #
+            # DEADLOCK SAFETY: the gathered tile x_g is IDENTICAL on every rank
+            # (all_gatherv), so M_g and the chunk count are identical across
+            # ranks. Both prefill and decode now follow the SAME structure
+            # (dispatch -> per-chunk compute -> combine), issuing the SAME
+            # collectives on every rank — there is no divergent-branch
+            # deadlock (the earlier local-M vs global-M branch mismatch is
+            # gone). No device->host sync is introduced, so CUDA-graph capture
+            # of the decode path (single <=8 chunk) is unaffected.
+            if getattr(self, "_is_ep_monokernel", False):
+                from vllm.distributed.parallel_state import get_ep_group
+                _ep = get_ep_group()
+                scoring_func = getattr(layer, "scoring_func", "softmax")
+                renormalize = getattr(layer, "renormalize", True)
+                self._fused_ar_did_reduce = False
+                CHUNK = 8
+
+                # ── SHARED-EXPERT / COMBINE OVERLAP (opt-in via
+                # VLLM_MOE_EP_SHARED_OVERLAP_COMBINE=1). The shared expert is the
+                # only compute in a decode MoE layer that is independent of the
+                # routed all-to-all. vLLM's default aux-stream overlap already
+                # hides it, but co-schedules it with the HBM-bound routed
+                # monokernel, so the two contend for HBM bandwidth. Here we
+                # instead run the shared expert on the aux stream ORDERED AFTER
+                # the routed monokernel, so it overlaps the COMBINE collective —
+                # which is NVLink/wait-bound with HBM idle. When enabled,
+                # mk_owns_shared_expert returns True, so the runner skips its own
+                # shared-expert calls and reads the result we store into
+                # layer.shared_experts._output. Values are identical to the
+                # runner's path (se._layer(x)); only the stream ordering changes.
+                import os as _os_ov
+                _se = getattr(layer, "shared_experts", None)
+                _overlap_shared = (
+                    _os_ov.environ.get("VLLM_MOE_EP_SHARED_OVERLAP_COMBINE") == "1"
+                    and _se is not None
+                    and getattr(_se, "_stream", None) is not None
+                )
+
+                def _nccl_combine(partial):
+                    return _ep.combine(partial, is_sequence_parallel=False)
+
+                def _combine_with_shared(partial, combine_fn=None):
+                    # Combine the per-rank partials back to local tokens,
+                    # optionally overlapping the shared expert with the combine.
+                    # combine_fn selects the reduce-scatter implementation
+                    # (NCCL by default; peer-memory when self-contained EP is on).
+                    cfn = combine_fn if combine_fn is not None else _nccl_combine
+                    if not _overlap_shared:
+                        return cfn(partial)
+                    aux = _se._stream
+                    cur = torch.cuda.current_stream()
+                    # Order the shared expert after ALL main-stream work so far
+                    # (dispatch + routed monokernel) so it starts alongside the
+                    # combine, not the routed compute.
+                    x.record_stream(aux)
+                    aux.wait_stream(cur)
+                    with torch.cuda.stream(aux):
+                        _se._output[_se._output_idx] = _se._layer(x)
+                    out = cfn(partial)
+                    # Main stream consumes the shared output downstream, so wait.
+                    cur.wait_stream(aux)
+                    return out
+
+                def _store_shared_inline():
+                    # Safety net for diagnostic early-returns that skip combine:
+                    # mk_owns_shared_expert is True, so the runner will read
+                    # _se._output and would assert if we left it unset.
+                    if _overlap_shared:
+                        _se._output[_se._output_idx] = _se._layer(x)
+
+                # Per-rank global token layout from DP metadata (CPU-side,
+                # already synchronized in coordinate_batch_across_dp — no new
+                # collective, no device->host sync). Used by BOTH paths below;
+                # identical on every rank, so any decision made from it is
+                # DP-consistent (deadlock-safe).
+                _sizes = None
+                try:
+                    from vllm.forward_context import get_forward_context
+                    _dpmd = getattr(get_forward_context(), "dp_metadata", None)
+                    if _dpmd is not None:
+                        _s = _dpmd.get_chunk_sizes_across_dp_rank()
+                        if _s is not None:
+                            _sizes = (_s.tolist() if hasattr(_s, "tolist")
+                                      else list(_s))
+                except Exception:
+                    _sizes = None
+
+                # ── IN-KERNEL DISPATCH (Stage 2 — all-to-all HIDING). Opt-in
+                # via VLLM_MOE_EP_INKERNEL_DISPATCH=1. Instead of all-gathering
+                # the activations over NCCL, each rank stages its OWN tokens
+                # into a peer-mapped buffer at their GLOBAL positions and the
+                # monokernel PEER-READS the remote tokens directly (folding the
+                # dispatch transfer into the kernel). Only the tiny router is
+                # gathered. Decode-shaped tile only (fits the BS8 kernel and the
+                # workspace); prefill uses the NCCL path below.
+                #
+                # CROSS-RANK ORDERING (graph-safe, no per-layer flag). The
+                # monokernel peer-reads the remote tokens, so the peer's write
+                # must be visible before we read. Instead of the per-layer
+                # storeLL/readLL flag handshake (whose flag value is baked into a
+                # CUDA graph and unstable under eager skew), we ORDER via the
+                # router all-gatherv we already issue: write our activations into
+                # the peer-mapped buffer FIRST, then the all-gatherv acts as a
+                # cross-rank barrier (a real NCCL collective that captures and
+                # replays correctly), so by the time any rank runs the kernel,
+                # every rank has completed its activation write. No baked flag,
+                # so this works under CUDA graphs (the regime where the hiding
+                # gain actually shows). peer_ll_buffers=None disables the
+                # in-kernel handshake (matches the validated M2b peer-read path).
+                _inkernel = (
+                    getattr(self, "_ep_inkernel_dispatch", False)
+                    and getattr(self, "_ep_act_ws", None) is not None
+                    and _sizes is not None
+                    and sum(_sizes) <= CHUNK
+                    and self._moe_ep_size == 2  # single-peer peer_activations
+                )
+                if _inkernel:
+                    from vllm.distributed.parallel_state import get_dp_group
+                    ws = self._ep_act_ws
+                    rank = _ep.rank_in_group
+                    M_g = int(sum(_sizes))
+                    start = int(sum(_sizes[:rank]))
+                    n_local = int(_sizes[rank])
+                    peer = rank ^ 1
+                    # 1) Stage this rank's tokens into the peer-mapped buffer at
+                    #    their global row positions (BEFORE the barrier).
+                    local_view, peer_views = ws.ep_activation_views(M_g)
+                    local_view.zero_()
+                    local_view[start:start + n_local] = x
+                    # 2) Router-only all-gather (tiny: [M_g, 256] bf16). Issued
+                    #    AFTER the write, so on every rank the write is stream-
+                    #    ordered before this collective; the collective can't
+                    #    complete until all ranks have entered it, hence all
+                    #    activation writes are done -> safe to peer-read.
+                    import os as _os_diag
+                    if _os_diag.environ.get("VLLM_MOE_EP_NO_ROUTER_AG") == "1":
+                        # DIAGNOSTIC ONLY (wrong output): drop the router
+                        # all-gather to measure whether the dispatch collective
+                        # is on the wall-clock critical path. Local rows only;
+                        # remote router rows are left zero (garbage output), so
+                        # use this to read STEP TIME, not coherence. If step
+                        # time is unchanged vs the all-gather path, the collective
+                        # is overlapped (not wall-critical) -> removing it for
+                        # real would not help, and dispatch is exhausted.
+                        rl_g = router_logits.new_zeros(
+                            (M_g, router_logits.size(1)))
+                        rl_g[start:start + n_local] = router_logits
+                    else:
+                        (rl_g,) = get_dp_group().all_gatherv(
+                            [router_logits], dim=0, sizes=_sizes)
+                    # 3) Kernel peer-reads the remote tokens (no flag handshake).
+                    partial = torch.ops.vllm.moe_monokernel_topk(
+                        local_view,
+                        rl_g,
+                        self._ep_w13_global,
+                        self._ep_w13_scale_global,
+                        self._ep_w2_global,
+                        self._ep_w2_scale_global,
+                        self.moe_monokernel_scratchpad,
+                        layer.top_k,
+                        scoring_func,
+                        renormalize,
+                        None,  # peer_ll_buffers (handshake disabled; barrier orders)
+                        None,  # residual_in
+                        None,  # residual_out
+                        None,  # rms_gamma
+                        0.0,   # rms_eps
+                        0,                   # ll_flag (unused)
+                        rank,                # tp_rank (= ep_rank)
+                        self._moe_ep_size,   # tp_size (= ep_size)
+                        self._moe_ep_expert_base,  # expert_base
+                        True,                # ep
+                        peer_views[peer],    # peer_activations (peer-mapped)
+                        start,               # local_token_start
+                        n_local,             # n_local_tokens
+                    )
+                    if _os_diag.environ.get("VLLM_MOE_EP_NO_COMBINE") == "1":
+                        # DIAGNOSTIC ONLY (wrong output): skip the reduce-scatter
+                        # combine to measure whether the COMBINE collective is on
+                        # the wall-clock critical path. Return this rank's local
+                        # token slice un-reduced (missing peer contributions ->
+                        # garbage), so read STEP TIME, not coherence. If step time
+                        # drops vs the combine path, combine IS wall-critical
+                        # (lever 2 has headroom); if unchanged, the entire EP
+                        # all-to-all is overlapped and has no E2E headroom.
+                        _store_shared_inline()
+                        return partial[start:start + n_local].contiguous()
+
+                    # ── SELF-CONTAINED COMBINE (opt-in via
+                    # VLLM_MOE_EP_INKERNEL_COMBINE=1). Replaces the NCCL
+                    # reduce-scatter with a symmetric-memory peer-reduce: each
+                    # rank stages its full [M_g, HIDDEN] partial into a distinct
+                    # peer-mapped region, a single tiny all-reduce orders the
+                    # writes (makes them cross-rank visible), then this rank
+                    # peer-reads every peer's partial for ITS OWN token rows and
+                    # sums — the reduce-scatter of the activation data now moves
+                    # over NVLink peer memory, not a collective kernel. Combined
+                    # with the peer-read dispatch above, the entire EP all-to-all
+                    # data movement is folded into the monokernel path; only a
+                    # 1-element ordering barrier remains (not the all-to-all).
+                    def _combine_peer(partial):
+                        cl, cp = ws.ep_combine_views(M_g)
+                        cl.copy_(partial)
+                        # Single ordering barrier: guarantees every rank has
+                        # written its partial (and its kernel has retired) before
+                        # any peer-read. A distinct region (not the dispatch one)
+                        # means no rank overwrites data a peer may still read, so
+                        # one barrier suffices.
+                        _ep.all_reduce(partial.new_zeros(1))
+                        out = partial[start:start + n_local].clone()
+                        for p in range(self._moe_ep_size):
+                            if p != rank:
+                                out = out + cp[p][start:start + n_local]
+                        return out
+
+                    if _os_diag.environ.get(
+                            "VLLM_MOE_EP_INKERNEL_COMBINE") == "1":
+                        return _combine_with_shared(partial, _combine_peer)
+                    return _combine_with_shared(partial)
+
+                # ── NCCL DISPATCH (default). All-gather the full token tile
+                # across DP (naive dispatch). is_sequence_parallel=False -> DP
+                # group (matches the modular kernel's internal dispatch). This
+                # is the transfer the in-kernel peer-read dispatch above HIDES.
+                x_g, rl_g = _ep.dispatch_router_logits(
+                    x, router_logits, is_sequence_parallel=False)
+
+                def _run_chunk(xc, rc):
+                    return torch.ops.vllm.moe_monokernel_topk(
+                        xc,
+                        rc,
+                        self._ep_w13_global,
+                        self._ep_w13_scale_global,
+                        self._ep_w2_global,
+                        self._ep_w2_scale_global,
+                        self.moe_monokernel_scratchpad,
+                        layer.top_k,
+                        scoring_func,
+                        renormalize,
+                        None,  # peer_ll_buffers
+                        None,  # residual_in
+                        None,  # residual_out
+                        None,  # rms_gamma
+                        0.0,   # rms_eps
+                        0,     # ll_flag
+                        _ep.rank_in_group,   # tp_rank (= ep_rank)
+                        self._moe_ep_size,   # tp_size (= ep_size)
+                        self._moe_ep_expert_base,  # expert_base
+                        True,  # ep
+                        None,  # peer_activations (in-kernel dispatch: future)
+                        0,     # local_token_start
+                        0,     # n_local_tokens
+                    )
+
+                M_g = x_g.size(0)
+                if M_g <= CHUNK:
+                    # Decode-shaped tile: single call (CUDA-graph capturable,
+                    # identical to the previously-verified decode path).
+                    partial = _run_chunk(x_g, rl_g)
+                elif (_os_ov.environ.get("VLLM_MOE_EP_PIPELINE_COMBINE") == "1"
+                      and _sizes is not None):
+                    # ── PIPELINED COMBINE (opt-in, large-token path). Overlap
+                    # communication with compute at CHUNK granularity: each
+                    # <=8-token chunk's cross-rank reduction runs on a side
+                    # stream concurrently with the NEXT chunk's expert compute on
+                    # the main stream, instead of one reduce-scatter after all
+                    # chunks finish. A chunk is not aligned to the rank-partition
+                    # boundaries, so reduce-scatter cannot be applied per chunk;
+                    # we instead all-reduce each chunk over the EP group and
+                    # slice this rank's own rows at the end (identical result:
+                    # sum over ranks then keep own tokens == reduce-scatter). The
+                    # chunk count is M_g/CHUNK on every rank, so the collective
+                    # sequence is identical and the run is deadlock-safe. At
+                    # large token counts the expert compute is large enough to
+                    # hide the per-chunk reduction behind it; at decode (single
+                    # chunk) there is nothing to overlap, hence the M_g>CHUNK
+                    # gate. Only the final chunk's reduction stays exposed.
+                    if getattr(self, "_ep_pipeline_stream", None) is None:
+                        # Created during eager warmup (before CUDA-graph capture).
+                        self._ep_pipeline_stream = torch.cuda.Stream()
+                    comm = self._ep_pipeline_stream
+                    cur = torch.cuda.current_stream()
+                    K_g = x_g.size(1)
+                    E_g = rl_g.size(1)
+                    rank = _ep.rank_in_group
+                    start = int(sum(_sizes[:rank]))
+                    n_local = int(_sizes[rank])
+                    red_parts = []
+                    for s in range(0, M_g, CHUNK):
+                        e = min(s + CHUNK, M_g)
+                        n = e - s
+                        if n == CHUNK:
+                            xc = x_g[s:e].contiguous()
+                            rc = rl_g[s:e].contiguous()
+                        else:
+                            xc = x_g.new_zeros((CHUNK, K_g))
+                            rc = rl_g.new_zeros((CHUNK, E_g))
+                            xc[:n] = x_g[s:e]
+                            rc[:n] = rl_g[s:e]
+                        pc = _run_chunk(xc, rc)          # main-stream compute
+                        # Reduce chunk on the side stream, overlapping the next
+                        # chunk's compute. record_stream keeps pc alive across
+                        # the stream boundary.
+                        pc.record_stream(comm)
+                        comm.wait_stream(cur)
+                        with torch.cuda.stream(comm):
+                            red_parts.append(_ep.all_reduce(pc)[:n])
+                    cur.wait_stream(comm)
+                    reduced = torch.cat(red_parts, dim=0)  # [M_g, H], summed
+                    # Slice this rank's own tokens (== reduce-scatter result).
+                    # Shared expert is added by the runner (mk_owns=False).
+                    return reduced[start:start + n_local].contiguous()
+                else:
+                    # Prefill: slice into <=8-token chunks, padding the last
+                    # chunk up to the kernel's fixed BS8 tile (pad rows carry
+                    # zero activations -> zero output, and are sliced off). The
+                    # chunk count is a function of M_g only, so it is identical
+                    # on every rank.
+                    K_g = x_g.size(1)
+                    E_g = rl_g.size(1)
+                    out_parts = []
+                    for s in range(0, M_g, CHUNK):
+                        e = min(s + CHUNK, M_g)
+                        n = e - s
+                        if n == CHUNK:
+                            xc = x_g[s:e].contiguous()
+                            rc = rl_g[s:e].contiguous()
+                        else:
+                            xc = x_g.new_zeros((CHUNK, K_g))
+                            rc = rl_g.new_zeros((CHUNK, E_g))
+                            xc[:n] = x_g[s:e]
+                            rc[:n] = rl_g[s:e]
+                        pc = _run_chunk(xc, rc)
+                        out_parts.append(pc[:n])
+                    partial = torch.cat(out_parts, dim=0)
+
+                # Reduce-scatter the per-rank partials back to local tokens
+                # (optionally overlapping the shared expert with the combine).
+                return _combine_with_shared(partial)
             M = x.size(0)
             if M <= 8:
                 # Scratchpad was moved to the weight device at load time

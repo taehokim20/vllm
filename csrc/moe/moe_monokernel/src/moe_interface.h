@@ -194,6 +194,49 @@ struct Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2 {
   };
 };
 
+// ── EP (expert-parallel) variant ────────────────────────────────────────
+// Milestone 1: each rank computes only its LOCAL slice of experts and emits
+// a PARTIAL output (the per-rank partials sum to the full reference; the
+// cross-rank sum is the future "combine" step).  NUM_EXPERTS stays 256 (the
+// GLOBAL count — routing/router_logits/barrier sizing are unchanged and run
+// over all 256), while NUM_LOCAL_EXPERTS=128 (the EP=2 slice).  The weight
+// tensors remain the full [256, ...] layout for Milestone 1 (a rank holds
+// all experts' weights but computes only its local range); `expert_base` is
+// a runtime kernel arg selecting the local range [base, base+128).  The
+// per-rank filter is applied in `prepare_moe_topk_BS8` via the existing
+// out-of-range sentinel, so weight indexing and TMA descriptors are
+// untouched.  Structurally identical to the TP=1 BS8 WGMMA+TMA Dims.
+struct Dims_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP {
+  static constexpr uint32_t HIDDEN_STATES = 2048;
+  static constexpr uint32_t K = 2048;
+  static constexpr uint32_t N = 512;
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;        // GLOBAL expert count
+  static constexpr uint32_t NUM_LOCAL_EXPERTS = 128;  // per-rank slice (EP=2)
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 8
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 16
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;  // 16
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;  // 4
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    static constexpr bool USE_TMA = true;
+    static constexpr std::uint32_t K_STEP_DOWN = 256;
+    static constexpr std::uint32_t K_STEP_UP = 256;
+    static constexpr bool USE_PAIR_LAYOUT = true;
+    static constexpr bool IS_EP = true;  // enables the local-expert filter
+  };
+};
+
 // Note: TP=4 (N=128) and TP=8 (N=64) cannot satisfy both constraints:
 // K_STEP_DOWN must be multiple of 128 AND N/K_STEP_DOWN must be even.
 // Only TP=2 is supported with the current WGMMA tiling.
@@ -271,7 +314,11 @@ __global__ extern void moe_kernel_topk(
     float rms_eps,
     std::uint32_t ll_flag,
     std::uint32_t tp_rank,
-    std::uint32_t tp_size);
+    std::uint32_t tp_size,
+    std::uint32_t expert_base,
+    const A_element* __restrict__ peer_activations,
+    std::uint32_t local_token_start,
+    std::uint32_t n_local_tokens);
 
 }  // namespace moe_monokernel
 

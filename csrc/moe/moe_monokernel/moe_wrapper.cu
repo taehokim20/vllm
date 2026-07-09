@@ -69,7 +69,10 @@ static_assert(
             const std::optional<torch::Tensor>& residual_out_opt,              \
             const std::optional<torch::Tensor>& rms_gamma_opt,                 \
             double rms_eps_dbl,                                                \
-            int64_t ll_flag_i64, int64_t tp_rank_i64, int64_t tp_size_i64) {   \
+            int64_t ll_flag_i64, int64_t tp_rank_i64, int64_t tp_size_i64,     \
+            int64_t expert_base_i64,                                            \
+            const std::optional<torch::Tensor>& peer_activations_opt,          \
+            int64_t local_token_start_i64, int64_t n_local_tokens_i64) {        \
     TORCH_CHECK(                                                               \
         activations_in.is_cuda(),                                              \
         "Optimized MoE kernel must be called with CUDA tensors only.");        \
@@ -141,6 +144,20 @@ static_assert(
     uint32_t ll_flag_u32 = static_cast<uint32_t>(ll_flag_i64);                 \
     uint32_t tp_rank_u32 = static_cast<uint32_t>(tp_rank_i64);                 \
     uint32_t tp_size_u32 = static_cast<uint32_t>(tp_size_i64);                 \
+    /* EP local-expert base (first global expert id owned by this rank).      \
+       Existing non-EP ops pass 0 from Python; the EP op passes its runtime   \
+       rank base. The kernel only consumes this when is_ep<Dims>. */          \
+    uint32_t expert_base_u32 = static_cast<uint32_t>(expert_base_i64);        \
+    /* EP dispatch (M2b): peer activation buffer + owned-token range.         \
+       Non-EP / no-dispatch callers pass None/0/0 -> nullptr -> no-op. */     \
+    const at::BFloat16* peer_activations_ptr =                                 \
+        peer_activations_opt.has_value()                                       \
+            ? peer_activations_opt.value().data_ptr<at::BFloat16>()            \
+            : nullptr;                                                         \
+    uint32_t local_token_start_u32 =                                           \
+        static_cast<uint32_t>(local_token_start_i64);                          \
+    uint32_t n_local_tokens_u32 =                                              \
+        static_cast<uint32_t>(n_local_tokens_i64);                             \
                                                                                \
     /* TMA descriptors for the BS8 WGMMA up-projection path (spec R6.2,        \
        R6.3) and down-projection path (spec R9.1, R9.2, R9.3).  Non-TMA        \
@@ -213,7 +230,11 @@ static_assert(
                            (void*)&rms_eps_f,                                  \
                            (void*)&ll_flag_u32,                                \
                            (void*)&tp_rank_u32,                                \
-                           (void*)&tp_size_u32};                               \
+                           (void*)&tp_size_u32,                               \
+                           (void*)&expert_base_u32,                           \
+                           (void*)&peer_activations_ptr,                      \
+                           (void*)&local_token_start_u32,                     \
+                           (void*)&n_local_tokens_u32};                       \
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();              \
     CUDA_CHECK(cudaFuncSetAttribute(                                           \
         moe_kernel_topk<dims>, cudaFuncAttributeMaxDynamicSharedMemorySize,    \
@@ -294,8 +315,7 @@ static_assert(
     }                                                                          \
     /* Standard (non-cooperative) launch.  The kernel reaches grid-wide        \
        happens-before via the software Grid_Barrier / Partial_Barrier          \
-       primitives in `src/moe_grid_barrier.h` (spec R1.1, R5.1, Design         \
-       Component C "Launch form") rather than                                  \
+       primitives in `src/moe_grid_barrier.h` rather than                      \
        `cooperative_groups::this_grid().sync()`.  Using standard               \
        `cudaLaunchKernel` is what lets the migrated kernel be captured         \
        into a CUDA Graph. */                                                   \
@@ -329,3 +349,12 @@ MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
 MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
     moe_monokernel_topk_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2_impl,
     moe_monokernel::Dims_BS8_E256_Qwen3_5_35B_BlockFP8_WGMMA_TMA_TP2)
+
+// EP variant (Milestone 1): same global weights [256, ...] as the TP=1 BS8
+// kernel, but each rank computes only its local expert range
+// [expert_base, expert_base + 128) and emits a PARTIAL output. The runtime
+// `expert_base` (last wrapper arg) selects the rank's slice; the EP filter
+// in prepare_moe_topk_BS8 (gated by is_ep<Dims>) drops non-local experts.
+MOEMONOKERNEL_TOPK_WRAPPER_IMPLEMENTATION(
+    moe_monokernel_topk_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP_impl,
+    moe_monokernel::Dims_BS8_E128_Qwen3_5_35B_BlockFP8_WGMMA_TMA_EP)

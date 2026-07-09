@@ -29,9 +29,102 @@ Usage (at model init, once per process):
     )
 """
 
+import ctypes
 import torch
 import torch.distributed as dist
 from typing import Optional
+
+
+class _cudaIpcMemHandle_t(ctypes.Structure):
+    # CUDA IPC handle is an opaque 64-byte blob; the struct is declared as
+    # CUDA_IPC_HANDLE_SIZE (64) bytes. We use 128 to be safe against ABI drift;
+    # only the first CUDA_IPC_HANDLE_SIZE bytes are meaningful and the same size
+    # is used symmetrically on every rank, so the extra padding is harmless.
+    _fields_ = [("internal", ctypes.c_byte * 128)]
+
+
+def _cudart():
+    return ctypes.CDLL("libcudart.so")
+
+
+# ── DLPack plumbing to alias a raw CUDA device pointer as a zero-copy torch
+# tensor. torch.as_tensor does NOT consume __cuda_array_interface__, but
+# torch.utils.dlpack.from_dlpack reliably imports a DLManagedTensor capsule. ──
+class _DLDevice(ctypes.Structure):
+    _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+
+class _DLDataType(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8),
+                ("lanes", ctypes.c_uint16)]
+
+
+class _DLTensor(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("device", _DLDevice),
+        ("ndim", ctypes.c_int),
+        ("dtype", _DLDataType),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("byte_offset", ctypes.c_uint64),
+    ]
+
+
+class _DLManagedTensor(ctypes.Structure):
+    pass
+
+
+_DL_DELETER = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
+_DLManagedTensor._fields_ = [
+    ("dl_tensor", _DLTensor),
+    ("manager_ctx", ctypes.c_void_p),
+    ("deleter", _DL_DELETER),
+]
+
+_PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+_PyCapsule_New.restype = ctypes.py_object
+_PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
+# Keep the ctypes managed-tensor / shape objects alive until torch calls the
+# deleter (i.e. until the aliasing tensor is freed).
+_DLPACK_KEEPALIVE: dict = {}
+
+
+def _dl_deleter(mt_ptr):
+    key = ctypes.cast(mt_ptr, ctypes.c_void_p).value
+    _DLPACK_KEEPALIVE.pop(key, None)
+
+
+_DL_DELETER_CB = _DL_DELETER(_dl_deleter)
+
+# DLPack device_type kDLCUDA = 2; dtype code kDLUInt = 1.
+_DLCUDA = 2
+_DLUINT = 1
+
+
+def _wrap_cuda_ptr(ptr: int, nbytes: int, device_index: int) -> torch.Tensor:
+    """Alias a raw CUDA device pointer as a zero-copy uint8 torch tensor.
+
+    The returned tensor does NOT own the memory; the caller must keep the
+    allocation alive and free it (cudaFree) separately.
+    """
+    import torch.utils.dlpack as _dlpack
+
+    shape = (ctypes.c_int64 * 1)(nbytes)
+    mt = _DLManagedTensor()
+    mt.dl_tensor.data = ptr
+    mt.dl_tensor.device = _DLDevice(_DLCUDA, device_index)
+    mt.dl_tensor.ndim = 1
+    mt.dl_tensor.dtype = _DLDataType(_DLUINT, 8, 1)
+    mt.dl_tensor.shape = shape
+    mt.dl_tensor.strides = ctypes.cast(None, ctypes.POINTER(ctypes.c_int64))
+    mt.dl_tensor.byte_offset = 0
+    mt.manager_ctx = None
+    mt.deleter = _DL_DELETER_CB
+    _DLPACK_KEEPALIVE[ctypes.addressof(mt)] = (mt, shape)
+    capsule = _PyCapsule_New(ctypes.addressof(mt), b"dltensor", None)
+    return _dlpack.from_dlpack(capsule)
 
 
 class MoELLWorkspace:
@@ -100,6 +193,10 @@ class MoELLWorkspace:
 
         # Exchange IPC handles to get peer pointers
         self._peer_buffers: list[int] = []  # device pointers as ints
+        # Multi-process CUDA-IPC bookkeeping (set by _setup_ipc_multiprocess).
+        self._ipc_multiprocess: bool = False
+        self._ipc_local_ptr: Optional[int] = None  # our cudaMalloc'd base
+        self._ipc_opened_ptrs: list[int] = []       # peer ptrs we opened
         self._setup_ipc()
 
         # Build the peer_ll_buffers tensor that gets passed to the kernel
@@ -109,284 +206,143 @@ class MoELLWorkspace:
 
     def _setup_ipc(self) -> None:
         """Setup cross-process GPU memory access for the LL protocol.
-        
-        For multi-process (torchrun): uses cuMemCreate + cuMemMap +
-        cuMemSetAccess (CUDA VMM) for kernel-level cross-process access.
-        
-        For single-process: uses raw pointer exchange with peer access.
+
+        Single-process multi-GPU (test harness): raw pointer exchange with
+        cudaDeviceEnablePeerAccess.
+
+        Multi-process (real DP / torchrun): CUDA IPC mem handles
+        (cudaMalloc + cudaIpcGetMemHandle + cudaIpcOpenMemHandle), exchanged
+        as plain bytes over the process group. This is backend-agnostic, needs
+        no shared filesystem path, and works for any group size and any number
+        of concurrent EP groups.
         """
         if self.tp_size == 1:
             self._peer_buffers = [self._local_buffer.data_ptr()]
             return
 
-        import ctypes
         import os
 
-        # Detect multi-process TP: if ranks are in different PIDs, we need
-        # VMM for cross-process kernel access. Check by gathering PIDs.
-        local_pid = torch.tensor([os.getpid()], dtype=torch.int64, device="cuda")
-        all_pids = [torch.zeros(1, dtype=torch.int64, device="cuda")
-                    for _ in range(self.tp_size)]
-        dist.all_gather(all_pids, local_pid, group=self.tp_group)
-        pids = [t.item() for t in all_pids]
-        is_multiprocess = len(set(pids)) > 1  # Different PIDs = different processes
+        # Detect multi-process TP by gathering PIDs. Use all_gather_object so
+        # this works on any collective backend (gloo/nccl) without a CUDA
+        # collective.
+        pids = [None] * self.tp_size
+        dist.all_gather_object(pids, os.getpid(), group=self.tp_group)
+        is_multiprocess = len(set(pids)) > 1
 
-        if not is_multiprocess:
-            # Single-process multi-GPU: raw pointers with peer access
-            cudart = ctypes.CDLL("libcudart.so")
-            cudart.cudaDeviceEnablePeerAccess.restype = ctypes.c_int
-            cudart.cudaDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
-            cudart.cudaGetLastError.restype = ctypes.c_int
-            cudart.cudaGetLastError.argtypes = []
-            local_device = torch.cuda.current_device()
-            for peer in range(self.tp_size):
-                if peer != local_device:
-                    err = cudart.cudaDeviceEnablePeerAccess(peer, 0)
-                    if err == 704:  # cudaErrorPeerAccessAlreadyEnabled
-                        cudart.cudaGetLastError()  # Clear the error state
-
-            local_ptr_tensor = torch.tensor(
-                [self._local_buffer.data_ptr()], dtype=torch.int64, device="cuda"
-            )
-            all_ptrs = [
-                torch.zeros(1, dtype=torch.int64, device="cuda")
-                for _ in range(self.tp_size)
-            ]
-            dist.all_gather(all_ptrs, local_ptr_tensor, group=self.tp_group)
-            self._peer_buffers = [t.item() for t in all_ptrs]
+        if is_multiprocess:
+            self._setup_ipc_multiprocess()
         else:
-            # Multi-process: use CUDA VMM for kernel-level cross-process access
-            self._setup_vmm()
+            self._setup_ipc_singleprocess()
 
-    def _setup_vmm(self) -> None:
-        """Setup cross-process access using CUDA VMM + Unix socket fd passing.
-
-        Each rank:
-        1. Allocates physical memory with cuMemCreate
-        2. Exports a shareable POSIX fd with cuMemExportToShareableHandle
-        3. Exchanges fds via Unix domain sockets (SCM_RIGHTS)
-        4. Imports peer handles and maps them into local VA space
-        5. Grants read/write access to all peer GPUs
-        """
-        import ctypes
-        import struct
-        import socket
-        import array
-        import os
-
-        cuda = ctypes.CDLL("libcuda.so")
-        cudart = ctypes.CDLL("libcudart.so")
-
-        # Type aliases
-        CUdeviceptr = ctypes.c_uint64
-        CUmemGenericAllocationHandle = ctypes.c_uint64
-
-        # Constants
-        CU_MEM_ALLOCATION_TYPE_PINNED = 1
-        CU_MEM_LOCATION_TYPE_DEVICE = 1
-        CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR = 1
-        CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
-
-        class CUmemAllocationProp(ctypes.Structure):
-            _fields_ = [
-                ("type", ctypes.c_int),
-                ("requestedHandleTypes", ctypes.c_int),
-                ("location_type", ctypes.c_int),
-                ("location_id", ctypes.c_int),
-                ("win32_security", ctypes.c_void_p),
-                ("reserved", ctypes.c_uint64 * 4),
-            ]
-
-        class CUmemAccessDesc(ctypes.Structure):
-            _fields_ = [
-                ("location_type", ctypes.c_int),
-                ("location_id", ctypes.c_int),
-                ("flags", ctypes.c_int),
-            ]
-
-        # Setup function signatures
-        cuda.cuMemGetAllocationGranularity.restype = ctypes.c_int
-        cuda.cuMemGetAllocationGranularity.argtypes = [
-            ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(CUmemAllocationProp), ctypes.c_int
-        ]
-        cuda.cuMemCreate.restype = ctypes.c_int
-        cuda.cuMemCreate.argtypes = [
-            ctypes.POINTER(CUmemGenericAllocationHandle), ctypes.c_size_t,
-            ctypes.POINTER(CUmemAllocationProp), ctypes.c_uint64
-        ]
-        cuda.cuMemAddressReserve.restype = ctypes.c_int
-        cuda.cuMemAddressReserve.argtypes = [
-            ctypes.POINTER(CUdeviceptr), ctypes.c_size_t, ctypes.c_size_t,
-            CUdeviceptr, ctypes.c_uint64
-        ]
-        cuda.cuMemMap.restype = ctypes.c_int
-        cuda.cuMemMap.argtypes = [
-            CUdeviceptr, ctypes.c_size_t, ctypes.c_size_t,
-            CUmemGenericAllocationHandle, ctypes.c_uint64
-        ]
-        cuda.cuMemSetAccess.restype = ctypes.c_int
-        cuda.cuMemSetAccess.argtypes = [
-            CUdeviceptr, ctypes.c_size_t, ctypes.POINTER(CUmemAccessDesc), ctypes.c_size_t
-        ]
-        cuda.cuMemExportToShareableHandle.restype = ctypes.c_int
-        cuda.cuMemExportToShareableHandle.argtypes = [
-            ctypes.POINTER(ctypes.c_int), CUmemGenericAllocationHandle,
-            ctypes.c_int, ctypes.c_uint64
-        ]
-        cuda.cuMemImportFromShareableHandle.restype = ctypes.c_int
-        cuda.cuMemImportFromShareableHandle.argtypes = [
-            ctypes.POINTER(CUmemGenericAllocationHandle), ctypes.c_int, ctypes.c_int
-        ]
-
+    def _setup_ipc_singleprocess(self) -> None:
+        """Single-process multi-GPU: raw pointers with peer access enabled."""
+        cudart = _cudart()
+        cudart.cudaDeviceEnablePeerAccess.restype = ctypes.c_int
+        cudart.cudaDeviceEnablePeerAccess.argtypes = [ctypes.c_int, ctypes.c_uint]
+        cudart.cudaGetLastError.restype = ctypes.c_int
+        cudart.cudaGetLastError.argtypes = []
         local_device = torch.cuda.current_device()
-
-        # Get granularity
-        prop = CUmemAllocationProp()
-        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED
-        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-        prop.location_type = CU_MEM_LOCATION_TYPE_DEVICE
-        prop.location_id = local_device
-
-        granularity = ctypes.c_size_t()
-        err = cuda.cuMemGetAllocationGranularity(ctypes.byref(granularity), ctypes.byref(prop), 0)
-        if err != 0:
-            raise RuntimeError(f"cuMemGetAllocationGranularity failed: {err}")
-
-        # Round up buffer size
-        alloc_size = ((self.buffer_size_bytes + granularity.value - 1)
-                      // granularity.value * granularity.value)
-
-        # Create physical memory
-        local_handle = CUmemGenericAllocationHandle()
-        err = cuda.cuMemCreate(ctypes.byref(local_handle), alloc_size, ctypes.byref(prop), 0)
-        if err != 0:
-            raise RuntimeError(f"cuMemCreate failed: {err}")
-
-        # Reserve VA and map
-        local_va = CUdeviceptr()
-        err = cuda.cuMemAddressReserve(ctypes.byref(local_va), alloc_size, granularity.value, 0, 0)
-        if err != 0:
-            raise RuntimeError(f"cuMemAddressReserve failed: {err}")
-        err = cuda.cuMemMap(local_va, alloc_size, 0, local_handle, 0)
-        if err != 0:
-            raise RuntimeError(f"cuMemMap failed: {err}")
-
-        # Set access for all GPUs
-        access_descs = (CUmemAccessDesc * self.tp_size)()
-        for i in range(self.tp_size):
-            access_descs[i].location_type = CU_MEM_LOCATION_TYPE_DEVICE
-            access_descs[i].location_id = i
-            access_descs[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE
-        err = cuda.cuMemSetAccess(local_va, alloc_size, access_descs, self.tp_size)
-        if err != 0:
-            raise RuntimeError(f"cuMemSetAccess failed: {err}")
-
-        # Export shareable fd
-        local_fd = ctypes.c_int()
-        err = cuda.cuMemExportToShareableHandle(
-            ctypes.byref(local_fd), local_handle,
-            CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0
-        )
-        if err != 0:
-            raise RuntimeError(f"cuMemExportToShareableHandle failed: {err}")
-
-        # Zero the buffer
-        cudart.cudaMemset.restype = ctypes.c_int
-        cudart.cudaMemset.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
-        cudart.cudaMemset(ctypes.c_void_p(local_va.value), 0, alloc_size)
-        torch.cuda.synchronize()
-
-        # ── Exchange fds via Unix domain sockets (SCM_RIGHTS) ──
-        # For each pair (i, j) where i < j, rank i is server, rank j is client.
-        # Each pair exchanges fds bidirectionally.
-        peer_fds = {}  # peer_rank -> received fd
-
         for peer in range(self.tp_size):
-            if peer == self.tp_rank:
-                continue
-            sock_path = f"/dev/shm/moe_ll_sock_{min(self.tp_rank, peer)}_{max(self.tp_rank, peer)}"
+            if peer != local_device:
+                err = cudart.cudaDeviceEnablePeerAccess(peer, 0)
+                if err == 704:  # cudaErrorPeerAccessAlreadyEnabled
+                    cudart.cudaGetLastError()  # Clear the error state
 
-            if self.tp_rank < peer:
-                # Server
-                if os.path.exists(sock_path):
-                    os.remove(sock_path)
-                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                server.bind(sock_path)
-                server.listen(1)
-                dist.barrier(group=self.tp_group)
-                conn, _ = server.accept()
-                # Send our fd
-                fds = array.array("i", [local_fd.value])
-                conn.sendmsg(
-                    [struct.pack("q", alloc_size)],
-                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)]
-                )
-                # Receive peer's fd
-                msg, ancdata, _, _ = conn.recvmsg(8, socket.CMSG_SPACE(4))
-                for cmsg_level, cmsg_type, cmsg_data in ancdata:
-                    if cmsg_type == socket.SCM_RIGHTS:
-                        peer_fds[peer] = array.array("i", cmsg_data)[0]
-                conn.close()
-                server.close()
-                os.remove(sock_path)
-            else:
-                # Client
-                dist.barrier(group=self.tp_group)
-                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                client.connect(sock_path)
-                # Receive peer's fd
-                msg, ancdata, _, _ = client.recvmsg(8, socket.CMSG_SPACE(4))
-                for cmsg_level, cmsg_type, cmsg_data in ancdata:
-                    if cmsg_type == socket.SCM_RIGHTS:
-                        peer_fds[peer] = array.array("i", cmsg_data)[0]
-                # Send our fd
-                fds = array.array("i", [local_fd.value])
-                client.sendmsg(
-                    [struct.pack("q", alloc_size)],
-                    [(socket.SOL_SOCKET, socket.SCM_RIGHTS, fds)]
-                )
-                client.close()
+        local_ptr_tensor = torch.tensor(
+            [self._local_buffer.data_ptr()], dtype=torch.int64, device="cuda"
+        )
+        all_ptrs = [
+            torch.zeros(1, dtype=torch.int64, device="cuda")
+            for _ in range(self.tp_size)
+        ]
+        dist.all_gather(all_ptrs, local_ptr_tensor, group=self.tp_group)
+        self._peer_buffers = [t.item() for t in all_ptrs]
 
-        dist.barrier(group=self.tp_group)
+    def _setup_ipc_multiprocess(self) -> None:
+        """Cross-process GPU sharing via classic CUDA IPC memory handles.
 
-        # ── Import peer handles and map into local VA ──
+        We deliberately DO NOT reuse torch's caching-allocator buffer here: when
+        torch is configured with expandable_segments (cuMem/VMM), its storage
+        IPC export (_share_cuda_) returns a torch-wire-format handle (~66 bytes)
+        that a raw cudaIpcOpenMemHandle rejects (cudaErrorInvalidValue). Instead
+        we make our own classic cudaMalloc allocation (immune to torch's
+        allocator config), which yields a clean 64-byte cudaIpcMemHandle, then
+        alias that pointer back into a torch tensor via DLPack so local writes /
+        zeroing are unchanged.
+
+        Handles are exchanged as plain bytes via all_gather_object: backend-
+        agnostic, no shared filesystem path, correct for any group size and any
+        number of concurrent EP groups. Replaces the earlier cuMem VMM +
+        Unix-socket fd-exchange path (deadlocked for group size > 2; collided
+        across EP groups on a shared /dev/shm socket path).
+        """
+        cudart = _cudart()
+        cudart.cudaMalloc.restype = ctypes.c_int
+        cudart.cudaMalloc.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+        cudart.cudaMemset.restype = ctypes.c_int
+        cudart.cudaMemset.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t]
+        cudart.cudaIpcGetMemHandle.restype = ctypes.c_int
+        cudart.cudaIpcGetMemHandle.argtypes = [
+            ctypes.POINTER(_cudaIpcMemHandle_t), ctypes.c_void_p]
+        cudart.cudaIpcOpenMemHandle.restype = ctypes.c_int
+        cudart.cudaIpcOpenMemHandle.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), _cudaIpcMemHandle_t, ctypes.c_uint]
+
+        size = self.buffer_size_bytes
+        local_device = torch.cuda.current_device()
+        hsize = ctypes.sizeof(_cudaIpcMemHandle_t)
+
+        # 1. Our own classic allocation (offset 0, clean IPC handle).
+        local_ptr = ctypes.c_void_p()
+        err = cudart.cudaMalloc(ctypes.byref(local_ptr), size)
+        if err != 0:
+            raise RuntimeError(f"cudaMalloc({size}) failed: {err}")
+        err = cudart.cudaMemset(local_ptr, 0, size)
+        if err != 0:
+            raise RuntimeError(f"cudaMemset failed: {err}")
+
+        # 2. Adopt as the local buffer (zero-copy DLPack alias of the IPC mem).
+        self._ipc_multiprocess = True
+        self._ipc_local_ptr = local_ptr.value
+        self._local_buffer = _wrap_cuda_ptr(local_ptr.value, size, local_device)
+
+        # 3. Export our clean handle + all-gather everyone's (raw bytes).
+        handle = _cudaIpcMemHandle_t()
+        err = cudart.cudaIpcGetMemHandle(ctypes.byref(handle), local_ptr)
+        if err != 0:
+            raise RuntimeError(f"cudaIpcGetMemHandle failed: {err}")
+        my_handle_bytes = ctypes.string_at(ctypes.byref(handle), hsize)
+
+        all_handles: list = [None] * self.tp_size
+        dist.all_gather_object(all_handles, my_handle_bytes, group=self.tp_group)
+
+        import os as _os
+        if _os.environ.get("VLLM_MOE_LL_DEBUG") == "1":
+            print(f"[MoELLWorkspace rank {self.tp_rank}] "
+                  f"local_ptr={local_ptr.value:#x} size={size} "
+                  f"handle_len={len(my_handle_bytes)}", flush=True)
+
+        # 4. Open peer handles -> peer device pointers.
+        CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 1
         self._peer_buffers = []
-        self._vmm_handles = [local_handle]
-        self._vmm_vas = [local_va.value]
-
+        self._ipc_opened_ptrs = []
         for i in range(self.tp_size):
             if i == self.tp_rank:
-                self._peer_buffers.append(local_va.value)
-            else:
-                peer_handle = CUmemGenericAllocationHandle()
-                err = cuda.cuMemImportFromShareableHandle(
-                    ctypes.byref(peer_handle), peer_fds[i],
-                    CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
-                )
-                if err != 0:
-                    raise RuntimeError(f"cuMemImportFromShareableHandle for rank {i} failed: {err}")
-
-                peer_va = CUdeviceptr()
-                err = cuda.cuMemAddressReserve(
-                    ctypes.byref(peer_va), alloc_size, granularity.value, 0, 0
-                )
-                if err != 0:
-                    raise RuntimeError(f"cuMemAddressReserve for peer {i} failed: {err}")
-
-                err = cuda.cuMemMap(peer_va, alloc_size, 0, peer_handle, 0)
-                if err != 0:
-                    raise RuntimeError(f"cuMemMap for peer {i} failed: {err}")
-
-                err = cuda.cuMemSetAccess(peer_va, alloc_size, access_descs, self.tp_size)
-                if err != 0:
-                    raise RuntimeError(f"cuMemSetAccess for peer {i} failed: {err}")
-
-                self._peer_buffers.append(peer_va.value)
-                self._vmm_handles.append(peer_handle)
-                self._vmm_vas.append(peer_va.value)
-
-        # Override local buffer pointer to use VMM-allocated memory
-        self._vmm_alloc_size = alloc_size
+                self._peer_buffers.append(self._ipc_local_ptr)
+                continue
+            h = _cudaIpcMemHandle_t()
+            ctypes.memmove(ctypes.byref(h), all_handles[i],
+                           min(len(all_handles[i]), hsize))
+            peer_ptr = ctypes.c_void_p()
+            err = cudart.cudaIpcOpenMemHandle(
+                ctypes.byref(peer_ptr), h, CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS)
+            if err != 0:
+                raise RuntimeError(
+                    f"cudaIpcOpenMemHandle for rank {i} failed: {err}")
+            self._peer_buffers.append(peer_ptr.value)
+            self._ipc_opened_ptrs.append(peer_ptr.value)
 
         dist.barrier(group=self.tp_group)
 
@@ -414,7 +370,22 @@ class MoELLWorkspace:
 
     def destroy(self) -> None:
         """Free resources."""
-        del self._local_buffer
+        if self._ipc_multiprocess:
+            cudart = _cudart()
+            cudart.cudaIpcCloseMemHandle.restype = ctypes.c_int
+            cudart.cudaIpcCloseMemHandle.argtypes = [ctypes.c_void_p]
+            cudart.cudaFree.restype = ctypes.c_int
+            cudart.cudaFree.argtypes = [ctypes.c_void_p]
+            for peer_ptr in self._ipc_opened_ptrs:
+                cudart.cudaIpcCloseMemHandle(ctypes.c_void_p(peer_ptr))
+            self._ipc_opened_ptrs = []
+            # Drop the DLPack alias before freeing the underlying allocation.
+            self._local_buffer = None
+            if self._ipc_local_ptr is not None:
+                cudart.cudaFree(ctypes.c_void_p(self._ipc_local_ptr))
+                self._ipc_local_ptr = None
+        else:
+            del self._local_buffer
         del self.peer_ll_buffers
         self._peer_buffers = []
 
@@ -422,3 +393,105 @@ class MoELLWorkspace:
     def local_buffer(self) -> torch.Tensor:
         """The raw local LL buffer (for debugging/testing)."""
         return self._local_buffer
+
+    # ──────────────────────────────────────────────────────────────────────
+    # EP in-kernel dispatch views.
+    #
+    # For the EP dispatch peer-read (Stage 2), the monokernel needs, per rank:
+    #   - a PLAIN bf16 activation staging region it writes its owned tokens
+    #     into (indexed by GLOBAL token id), and
+    #   - the PEER's staging region, peer-mapped, to read the remote tokens;
+    #   - a tiny per-rank readiness-FLAG slot (the storeLL/readLL handshake),
+    #     peer-mapped, so a rank does not read before the peer has written.
+    #
+    # We carve the symmetric IPC buffer as:
+    #   [ bf16 activation region: max_num_tokens * hidden_dim * 2 bytes ]
+    #   [ ... unused ... ]
+    #   [ flag region: last _EP_FLAG_REGION_BYTES bytes ]
+    # The buffer is symmetric across ranks, so a peer's region is at the same
+    # offset in the peer pointer. Only valid on a workspace created for this
+    # purpose (its LL-all-reduce role must not be used simultaneously).
+    # ──────────────────────────────────────────────────────────────────────
+    _EP_FLAG_REGION_BYTES = 256   # >> tp_size * 16; kept off the activations
+    _EP_FLAG_STRIDE = 16          # one LLPacket-sized slot per rank
+
+    def _ep_flag_base_offset(self) -> int:
+        return self.buffer_size_bytes - self._EP_FLAG_REGION_BYTES
+
+    def ep_activation_views(self, num_tokens: int):
+        """Return (local_view, peer_views) as bf16 [num_tokens, hidden_dim].
+
+        local_view aliases THIS rank's staging region (write owned rows here);
+        peer_views[i] aliases rank i's staging region (peer-mapped) for the
+        kernel's `peer_activations`. peer_views[tp_rank] is local_view.
+        """
+        K = self.hidden_dim
+        nbytes = num_tokens * K * 2  # bf16
+        assert nbytes <= self._ep_flag_base_offset(), (
+            f"activation region {nbytes} B overruns flag region at "
+            f"{self._ep_flag_base_offset()} B (raise max_num_tokens/buffer)"
+        )
+        dev_index = torch.cuda.current_device()
+        local_view = (
+            self._local_buffer[:nbytes].view(torch.bfloat16).view(num_tokens, K)
+        )
+        peer_views = []
+        for i in range(self.tp_size):
+            if i == self.tp_rank:
+                peer_views.append(local_view)
+            else:
+                u8 = _wrap_cuda_ptr(self._peer_buffers[i], nbytes, dev_index)
+                peer_views.append(u8.view(torch.bfloat16).view(num_tokens, K))
+        return local_view, peer_views
+
+    def ep_combine_views(self, num_tokens: int):
+        """Return (local_view, peer_views) for the in-kernel EP COMBINE.
+
+        Symmetric to ep_activation_views but at a DISTINCT offset (the second
+        half of the buffer), so the combine can stage this rank's full per-rank
+        partial [num_tokens, hidden_dim] without clobbering the dispatch
+        activation region (which a peer may still be reading). Each rank writes
+        its partial into local_view; after a cross-rank ordering barrier, rank r
+        peer-reads peer_views[p][own_rows] and sums to reduce-scatter WITHOUT a
+        NCCL collective moving the activation data.
+        """
+        K = self.hidden_dim
+        nbytes = num_tokens * K * 2  # bf16
+        off = self.buffer_size_bytes // 2
+        assert num_tokens * K * 2 <= off, (
+            f"combine region base {off} overlaps dispatch region "
+            f"({num_tokens * K * 2} B)"
+        )
+        assert off + nbytes <= self._ep_flag_base_offset(), (
+            f"combine region {nbytes} B at {off} overruns flag region at "
+            f"{self._ep_flag_base_offset()} B (raise max_num_tokens/buffer)"
+        )
+        dev_index = torch.cuda.current_device()
+        local_view = (
+            self._local_buffer[off:off + nbytes]
+            .view(torch.bfloat16).view(num_tokens, K)
+        )
+        peer_views = []
+        for i in range(self.tp_size):
+            if i == self.tp_rank:
+                peer_views.append(local_view)
+            else:
+                u8 = _wrap_cuda_ptr(self._peer_buffers[i] + off, nbytes, dev_index)
+                peer_views.append(u8.view(torch.bfloat16).view(num_tokens, K))
+        return local_view, peer_views
+
+    def ep_flag_buffers(self) -> torch.Tensor:
+        """int64 [tp_size]: peer-mapped pointer to each rank's readiness-flag
+        slot (same layout the M2c handshake expects for `peer_ll_buffers`)."""
+        off = self._ep_flag_base_offset()
+        return torch.tensor(
+            [p + off for p in self._peer_buffers],
+            dtype=torch.int64, device="cuda",
+        )
+
+    def ep_zero_flags(self) -> None:
+        """Zero this rank's readiness-flag slot (call once per forward, before
+        the first layer, so stale flags from the previous forward do not match)."""
+        off = self._ep_flag_base_offset()
+        self._local_buffer[off:off + self._EP_FLAG_REGION_BYTES].zero_()
+        self._flag_counter = 0
