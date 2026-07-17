@@ -49,6 +49,19 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_moe_C, m) {
   // LIBRARY_IMPL block next to where the kernels are defined) — the same
   // def-in-bindings / impl-in-source split dsv3_router_gemm uses.
 #include "moe/moe_monokernel/generated/defs_generated.inc"
+  // Hand-written EP dispatch op (impl TORCH_BOX'd in moe_wrapper.cu). Kept out
+  // of the generated defs so re-onboarding cannot clobber it. Same schema as a
+  // base BS8 op plus the four EP args (peer_activations is optional).
+  m.def(
+      "moe_monokernel_topk_ep(Tensor activations_in,"
+      "Tensor router_logits,"
+      "Tensor expert_weights_up, Tensor expert_scales_up,"
+      "Tensor expert_weights_down, Tensor expert_scales_down,"
+      "Tensor! activations_out, Tensor! scratchpad,"
+      "int top_k, int scoring_func, bool renormalize,"
+      "Tensor? expert_bias, float routed_scaling_factor,"
+      "Tensor? peer_activations, int expert_base, int local_token_start,"
+      "int n_local_tokens) -> ()");
 #endif
 
   // Aligning the number of tokens to be processed by each expert such

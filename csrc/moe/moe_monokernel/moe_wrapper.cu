@@ -313,6 +313,36 @@ void launch_moe_monokernel(
 #include "generated/config_table_generated.inc"
 #include "generated/wrapper_generated.inc"
 
+// ── Hand-written EP dispatch op (generator-independent) ──────────────────
+// Not emitted by gen_shapes.py so re-onboarding never clobbers it. Mirrors a
+// generated `*_impl` wrapper but (a) targets the hand EP Dims variant and
+// (b) forwards the four EP args to launch_moe_monokernel. Single op for the
+// DeepSeek-V4-Flash EP=2 shape; add more here if other EP shapes are needed.
+// Schema (m.def) lives in csrc/libtorch_stable/moe/torch_bindings.cpp; the
+// m.impl binding is added in the STABLE_TORCH_LIBRARY_IMPL block below.
+void moe_monokernel_topk_ep_impl(
+    const torch::stable::Tensor& activations_in,
+    const torch::stable::Tensor& router_logits,
+    const torch::stable::Tensor& expert_weights_up,
+    const torch::stable::Tensor& expert_scales_up,
+    const torch::stable::Tensor& expert_weights_down,
+    const torch::stable::Tensor& expert_scales_down,
+    torch::stable::Tensor& activations_out, torch::stable::Tensor& scratchpad,
+    int64_t top_k, int64_t scoring_func, bool renormalize,
+    const std::optional<torch::stable::Tensor>& expert_bias,
+    double routed_scaling_factor,
+    // EP dispatch args:
+    const std::optional<torch::stable::Tensor>& peer_activations,
+    int64_t expert_base, int64_t local_token_start, int64_t n_local_tokens) {
+  moe_monokernel::launch_moe_monokernel<
+      moe_monokernel::Dims_BS8_E256_N2048_K4096_BlockFP8_WGMMA_TMA_EP>(
+      activations_in, router_logits, expert_weights_up, expert_scales_up,
+      expert_weights_down, expert_scales_down, activations_out, scratchpad,
+      top_k, scoring_func, renormalize, expert_bias, routed_scaling_factor,
+      "moe_monokernel_topk_ep", peer_activations, expert_base,
+      local_token_start, n_local_tokens);
+}
+
 // The monokernel *_impl functions take torch::stable::Tensor (stable-ABI
 // port), so they are TORCH_BOX'd into the _moe_C stable dispatcher here, next
 // to where the X-macro / generated wrapper defines them.  Their m.def schemas
@@ -321,5 +351,7 @@ void launch_moe_monokernel(
 #ifndef USE_ROCM
 STABLE_TORCH_LIBRARY_IMPL(_moe_C, CUDA, m) {
 #include "generated/impls_generated.inc"
+  // Hand EP op (schema in libtorch_stable/moe/torch_bindings.cpp).
+  m.impl("moe_monokernel_topk_ep", TORCH_BOX(&moe_monokernel_topk_ep_impl));
 }
 #endif

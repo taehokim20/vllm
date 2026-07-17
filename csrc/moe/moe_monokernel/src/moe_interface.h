@@ -43,6 +43,52 @@ struct MoEDimensions {
 // rebuild.  DO NOT hand-edit the generated file.
 #include "../generated/dims_generated.inc"
 
+// ── EP (expert-parallel) variant of the DeepSeek-V4-Flash full-N shape ──
+// Hand-written (NOT generated): the EP dispatch path is maintained outside
+// gen_shapes.py so re-onboarding never clobbers it. Cloned from the generated
+// `Dims_BS8_E256_N2048_K4096_BlockFP8_WGMMA_TMA` (keep the two in sync if the
+// base shape's KernelConfig is retuned).
+//
+// EP shards EXPERTS, not N: NUM_EXPERTS stays the GLOBAL 256 (routing /
+// router_logits width / software-barrier sizing are unchanged and run over all
+// 256), N stays full (2048). NUM_LOCAL_EXPERTS=128 is the EP=2 per-rank slice;
+// each rank is given a [256, ...] weight buffer with only its local experts
+// filled, and the `is_ep` filter in prepare_moe_topk_BS8 keeps only routed ids
+// in [expert_base, expert_base + 128) (others -> 0xFFFF sentinel, skipped).
+// Structurally identical to the base Dims otherwise, so the whole TMA / WGMMA
+// pipeline is unchanged.
+struct Dims_BS8_E256_N2048_K4096_BlockFP8_WGMMA_TMA_EP {
+  static constexpr uint32_t HIDDEN_STATES = 4096;
+  static constexpr uint32_t K = 4096;
+  static constexpr uint32_t N = 2048;
+  static constexpr uint32_t BS = 8;
+  static constexpr uint32_t M = 8;
+  static constexpr uint32_t NUM_EXPERTS = 256;        // GLOBAL expert count
+  static constexpr uint32_t NUM_LOCAL_EXPERTS = 128;  // per-rank slice (EP=2)
+  static constexpr QuantGranularity QUANT_GRAN = QuantGranularity::BLOCK_WISE;
+  static constexpr uint32_t BLOCK_SCALE_ROW = 128;
+  static constexpr uint32_t BLOCK_SCALE_COL = 128;
+  static constexpr uint32_t UP_SCALE_ROWS =
+      (2 * N + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
+  static constexpr uint32_t UP_SCALE_COLS =
+      (K + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
+  static constexpr uint32_t DOWN_SCALE_ROWS =
+      (K + BLOCK_SCALE_ROW - 1) / BLOCK_SCALE_ROW;
+  static constexpr uint32_t DOWN_SCALE_COLS =
+      (N + BLOCK_SCALE_COL - 1) / BLOCK_SCALE_COL;
+  struct KernelConfig {
+    static constexpr std::uint32_t GRID_SIZE = 128;
+    static constexpr std::uint32_t BLOCK_SIZE = 384;
+    static constexpr bool USE_WGMMA = true;
+    static constexpr bool USE_TMA = true;
+    static constexpr std::uint32_t K_STEP_DOWN = 128;
+    static constexpr std::uint32_t K_STEP_UP = 256;
+    static constexpr std::uint32_t UP_W_SLOTS = 2;
+    static constexpr bool USE_PAIR_LAYOUT = true;
+    static constexpr bool IS_EP = true;  // enables local-expert filter + peer-read
+  };
+};
+
 // Extracts a shape's explicit `KernelConfig::UP_COL_HALVES` if it pins one
 // (decoupled shapes), else 0 to signal "derive from DOWN_COL_TILE" (coupled
 // shapes).  Self-contained here (no dependency on the detectors in
