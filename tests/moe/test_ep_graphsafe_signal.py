@@ -43,66 +43,70 @@ _MONO_SRC = os.path.abspath(
 
 # Probe kernels: include the real signaling header so we test the shipped code.
 _CUDA_SRC = r"""
-#include <cuda_bf16.h>
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <stdint.h>
 #include "moe_comm_ll.h"
 
 using moe_monokernel::ep_set_ready;
 using moe_monokernel::ep_wait_ready;
 using moe_monokernel::load_epoch;
 
-// Producer: fill this rank's staging row with (epoch*10 + rank), then publish
-// readiness into this rank's own flag slot.
-__global__ void probe_write_kernel(__nv_bfloat16* stage, uint32_t* my_flag,
-                                    const uint32_t* epoch_ptr, int rank,
-                                    int hidden) {
-  uint32_t epoch = load_epoch(epoch_ptr);
-  float payload = (float)(epoch * 10u + (uint32_t)rank);
-  for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
-    stage[i] = (__nv_bfloat16)payload;
-  }
-  __syncthreads();
+// The staging region is raw bytes; we reinterpret its first word as uint32 so
+// the payload is delivered EXACTLY (a bf16 buffer cannot represent odd/large
+// integers, which would make the proof's equality check spuriously fail on
+// rounding rather than on any signaling error).
+//
+// Producer: write (epoch*1000 + rank) into this rank's staging word, then
+// publish readiness into this rank's own flag slot.
+__global__ void probe_write_kernel(uint32_t* stage, uint32_t* my_flag,
+                                    const uint32_t* epoch_ptr, int rank) {
   if (threadIdx.x == 0) {
+    uint32_t epoch = load_epoch(epoch_ptr);
+    stage[0] = epoch * 1000u + (uint32_t)rank;
+    // ep_set_ready issues __threadfence_system() before the flag store, so the
+    // stage[0] write above is guaranteed visible to the peer once the flag is.
     ep_set_ready(my_flag, epoch_ptr);
   }
 }
 
-// Consumer: wait on the peer's flag for this epoch, then read the peer's row.
-__global__ void probe_read_kernel(const __nv_bfloat16* peer_stage,
+// Consumer: wait on the peer's flag for this epoch, then read the peer's word.
+__global__ void probe_read_kernel(const uint32_t* peer_stage,
                                    const uint32_t* peer_flag,
-                                   const uint32_t* epoch_ptr, float* out,
-                                   int hidden) {
+                                   const uint32_t* epoch_ptr, uint32_t* out) {
   if (threadIdx.x == 0) {
     ep_wait_ready(peer_flag, epoch_ptr);
-  }
-  __syncthreads();
-  // Read element 0 (all elements are identical) into out.
-  if (threadIdx.x == 0) {
-    *out = (float)peer_stage[0];
+    *out = peer_stage[0];
   }
 }
 
 void probe_write(int64_t stage_ptr, int64_t my_flag_ptr, int64_t epoch_ptr,
-                 int64_t rank, int64_t hidden) {
-  probe_write_kernel<<<1, 256>>>(
-      reinterpret_cast<__nv_bfloat16*>(stage_ptr),
+                 int64_t rank) {
+  // Launch on the CURRENT stream so that under CUDA-graph capture the kernel
+  // is (a) captured and (b) ordered AFTER the epoch increment on the same
+  // stream. A bare <<<...>>> would use the default stream, which is not the
+  // capture stream -> the kernel would read a stale (never-advancing) epoch.
+  cudaStream_t s = c10::cuda::getCurrentCUDAStream();
+  probe_write_kernel<<<1, 32, 0, s>>>(
+      reinterpret_cast<uint32_t*>(stage_ptr),
       reinterpret_cast<uint32_t*>(my_flag_ptr),
-      reinterpret_cast<const uint32_t*>(epoch_ptr), (int)rank, (int)hidden);
+      reinterpret_cast<const uint32_t*>(epoch_ptr), (int)rank);
 }
 
 void probe_read(int64_t peer_stage_ptr, int64_t peer_flag_ptr,
-                int64_t epoch_ptr, int64_t out_ptr, int64_t hidden) {
-  probe_read_kernel<<<1, 256>>>(
-      reinterpret_cast<const __nv_bfloat16*>(peer_stage_ptr),
+                int64_t epoch_ptr, int64_t out_ptr) {
+  cudaStream_t s = c10::cuda::getCurrentCUDAStream();
+  probe_read_kernel<<<1, 32, 0, s>>>(
+      reinterpret_cast<const uint32_t*>(peer_stage_ptr),
       reinterpret_cast<const uint32_t*>(peer_flag_ptr),
       reinterpret_cast<const uint32_t*>(epoch_ptr),
-      reinterpret_cast<float*>(out_ptr), (int)hidden);
+      reinterpret_cast<uint32_t*>(out_ptr));
 }
 """
 
 _CPP_DECL = (
-    "void probe_write(int64_t, int64_t, int64_t, int64_t, int64_t);\n"
-    "void probe_read(int64_t, int64_t, int64_t, int64_t, int64_t);\n"
+    "void probe_write(int64_t, int64_t, int64_t, int64_t);\n"
+    "void probe_read(int64_t, int64_t, int64_t, int64_t);\n"
 )
 
 
@@ -144,7 +148,7 @@ def main():
     my_flag_ptr = int(flags[rank].item())
     peer_flag_ptr = int(flags[peer].item())
     epoch_ptr = ws.epoch_ptr()
-    out = torch.zeros(1, dtype=torch.float32, device="cuda")
+    out = torch.zeros(1, dtype=torch.int32, device="cuda")
 
     stage_ptr = int(local_view.data_ptr())
     peer_stage_ptr = int(peer_view.data_ptr())
@@ -159,9 +163,9 @@ def main():
     with torch.cuda.stream(stream):
         # warmup (also lets JIT/autotune settle) — not captured
         ws.advance_epoch()
-        probe.probe_write(stage_ptr, my_flag_ptr, epoch_ptr, rank, args.hidden)
+        probe.probe_write(stage_ptr, my_flag_ptr, epoch_ptr, rank)
         probe.probe_read(peer_stage_ptr, peer_flag_ptr, epoch_ptr,
-                         int(out.data_ptr()), args.hidden)
+                         int(out.data_ptr()))
     torch.cuda.current_stream().wait_stream(stream)
     dist.barrier()
     # Reset epoch to 0 and clear the buffer so warmup's stale flags cannot be
@@ -173,17 +177,17 @@ def main():
     g = torch.cuda.CUDAGraph()
     with torch.cuda.graph(g):
         ws.advance_epoch()
-        probe.probe_write(stage_ptr, my_flag_ptr, epoch_ptr, rank, args.hidden)
+        probe.probe_write(stage_ptr, my_flag_ptr, epoch_ptr, rank)
         probe.probe_read(peer_stage_ptr, peer_flag_ptr, epoch_ptr,
-                         int(out.data_ptr()), args.hidden)
+                         int(out.data_ptr()))
 
     # ── Replay: each step epoch increments; expect peer's CURRENT payload ──
     failures = 0
     for step in range(1, args.steps + 1):
         g.replay()
         torch.cuda.synchronize()
-        expected = float(step * 10 + peer)  # peer wrote epoch*10 + peer
-        got = float(out.item())
+        expected = step * 1000 + peer  # peer wrote epoch*1000 + peer (exact)
+        got = int(out.item())
         if got != expected:
             failures += 1
             if failures <= 5:
