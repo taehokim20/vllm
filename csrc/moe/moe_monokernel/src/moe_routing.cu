@@ -256,7 +256,8 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
 template <typename Dims>
 __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
                                      MoE_SHM<Dims>* __restrict__ shm,
-                                     MoEGemmSpec<Dims>* __restrict__ spec) {
+                                     MoEGemmSpec<Dims>* __restrict__ spec,
+                                     uint32_t expert_base = 0u) {
   static_assert(Dims::BS <= 8, "Dispatch to incorrect implementation");
   static_assert(use_tma<Dims>::value, "BS8 prepare path is TMA-only.");
   // `spec` is only used for MONO_PROFILE_PHASE_TIMING.
@@ -289,7 +290,20 @@ __device__ void prepare_moe_topk_BS8(uint32_t batch_size, uint32_t top_k,
     if (pair >= n_pairs) return (uint16_t)0xFFFF;
     const uint32_t tok = pair / top_k;
     const uint32_t k = pair % top_k;
-    return shm->topk_ids_flat[tok * MAX_TOPK + k];
+    const uint16_t eid = shm->topk_ids_flat[tok * MAX_TOPK + k];
+    if constexpr (is_ep<Dims>::value) {
+      // EP: keep only experts owned by this rank. Non-local experts are
+      // remapped to the out-of-range sentinel (0xFFFF) so every downstream
+      // phase skips them via the existing `eid < NUM_EXPERTS` guard. The
+      // expert id stays GLOBAL — the rank is given a [NUM_EXPERTS, ...] weight
+      // buffer with only its local experts filled, so global-id indexing reads
+      // the correct (filled) rows and non-local experts are never fetched.
+      constexpr uint32_t NLOCAL = num_local_experts<Dims>::value;
+      if (eid < expert_base || eid >= expert_base + NLOCAL) {
+        return (uint16_t)0xFFFF;
+      }
+    }
+    return eid;
   };
   const uint16_t eid0 = load_pair_eid(p0);
   const uint16_t eid1 = load_pair_eid(p1);

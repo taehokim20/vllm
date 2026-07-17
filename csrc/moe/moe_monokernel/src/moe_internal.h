@@ -132,6 +132,49 @@ struct use_pair_layout {
   static constexpr bool value = test<Dims>(0);
 };
 
+// ── EP (expert-parallel) opt-in detection ──────────────────────────────
+// `Dims::KernelConfig::IS_EP` is optional; defaults to false so every
+// existing (non-EP) Dims variant compiles byte-identically — the EP filter
+// in the routing/prepare path is guarded by `if constexpr (is_ep<Dims>::value)`
+// and collapses to nothing for them.  Only the EP Dims variants set
+// IS_EP=true, enabling the local-expert filter + the dispatch peer-read.
+template <typename Dims>
+struct is_ep {
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype(D::KernelConfig::IS_EP, bool()) {
+    return D::KernelConfig::IS_EP;
+  }
+  template <typename>
+  static constexpr bool test(...) {
+    return false;
+  }
+  static constexpr bool value = test<Dims>(0);
+};
+
+// ── Local-expert count for EP variants ──────────────────────────────────
+// `Dims::NUM_LOCAL_EXPERTS` is optional; defaults to `Dims::NUM_EXPERTS`
+// (= all experts local, i.e. non-EP).  For EP, NUM_EXPERTS stays the GLOBAL
+// expert count (used for routing / router_logits width / barrier sizing)
+// while NUM_LOCAL_EXPERTS is the per-rank slice (e.g. 128 at EP=2 for a
+// 256-expert model such as DeepSeek-V4-Flash).
+template <typename Dims>
+struct num_local_experts {
+ private:
+  template <typename D>
+  static constexpr auto test(int)
+      -> decltype((std::uint32_t)D::NUM_LOCAL_EXPERTS) {
+    return (std::uint32_t)D::NUM_LOCAL_EXPERTS;
+  }
+  template <typename>
+  static constexpr std::uint32_t test(...) {
+    return (std::uint32_t)Dims::NUM_EXPERTS;
+  }
+
+ public:
+  static constexpr std::uint32_t value = test<Dims>(0);
+};
+
 // K_STEP_DOWN: K-width per outer down-proj K-step.  Multiple of 128 (the
 // SWZ128 atom width); must divide Dims::N.  Larger steps amortize launcher
 // and barrier-wait overhead over more compute at the cost of larger
@@ -384,7 +427,7 @@ struct MoEGemmSpec {
 
 // Maximum supported dimensions.  Sizes only the max-SHM / max-scratchpad
 // bookkeeping (`get_moe_max_*`); never launched.
-using Dims_Max = MoEDimensions<1024, 1024, 6144, 512>;
+using Dims_Max = MoEDimensions<1024, 2048, 6144, 512>;
 
 // Block-wise quantization detection for the SHM scale-tile sizing below.
 template <typename Dims>

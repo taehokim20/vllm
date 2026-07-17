@@ -53,7 +53,19 @@ __device__ void moe_kernel_topk_BS8(
     CUtensorMap const& down_weights_desc,
     CUtensorMap const& down_activations_desc,
     uint32_t* __restrict__ expert_counters, uint32_t& expert_phase,
-    uint32_t* __restrict__ colstripe_counters, uint32_t& colstripe_phase) {
+    uint32_t* __restrict__ colstripe_counters, uint32_t& colstripe_phase,
+    // ── EP dispatch (option 1: external one-sided wait) ──────────────────
+    // expert_base: first GLOBAL expert index this rank owns (local range is
+    //   [expert_base, expert_base + num_local_experts<Dims>)); used by the
+    //   routing filter in prepare_moe_topk_BS8 when is_ep<Dims>.
+    // peer_activations: peer-mapped staging buffer; when non-null, remote
+    //   token rows (outside [local_token_start, +n_local_tokens)) are
+    //   peer-read in routing_phase_quantize. Cross-rank ordering is provided
+    //   by the ep_set_ready/ep_wait_ready handshake issued around the launch
+    //   in Python (fp8.py), so no in-kernel wait is needed here.
+    std::uint32_t expert_base,
+    const A_element* __restrict__ peer_activations,
+    std::uint32_t local_token_start, std::uint32_t n_local_tokens) {
   static_assert(Dims::BS <= 8);
   static_assert(use_wgmma<Dims>::value,
                 "BS8 path requires the WGMMA configuration (use_wgmma).");
@@ -129,7 +141,7 @@ __device__ void moe_kernel_topk_BS8(
   // disjoint SHM; the single trailing __syncthreads() publishes both to
   // all warps before Phase 3.
   if (warp_id == 0) {
-    prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec);
+    prepare_moe_topk_BS8<Dims>(batch_size, top_k, shmem, spec, expert_base);
   } else {
 #ifndef MONO_PROFILE_SKIP_PREFETCH_UP
     uint32_t parity_rwin = 0;
@@ -137,8 +149,14 @@ __device__ void moe_kernel_topk_BS8(
     }
 #endif
 #ifndef MONO_PROFILE_SKIP_CALC_UP
+    // EP dispatch overlap: own_hi is clamped so that when peer_activations is
+    // null (non-EP) own_lo==own_hi==0 and routing_phase_quantize takes the
+    // original path (no peer-read) byte-identically.
+    const std::uint32_t own_lo = local_token_start;
+    const std::uint32_t own_hi = local_token_start + n_local_tokens;
     routing_phase_quantize<Dims>(u_tma->bf16_in_full, u_tma->fp8_act_full,
-                                 shmem->act_scale, batch_size);
+                                 shmem->act_scale, batch_size,
+                                 peer_activations, own_lo, own_hi);
 #endif
   }
   __syncthreads();
@@ -307,7 +325,11 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
     __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
-    __grid_constant__ CUtensorMap const down_activations_desc) {
+    __grid_constant__ CUtensorMap const down_activations_desc,
+    // EP dispatch args (inert when peer_activations==nullptr / n_local==0).
+    std::uint32_t expert_base,
+    const A_element* __restrict__ peer_activations,
+    std::uint32_t local_token_start, std::uint32_t n_local_tokens) {
   static_assert(!use_tma<Dims>::value || use_wgmma<Dims>::value,
                 "USE_TMA requires USE_WGMMA; no TMA support for the scalar "
                 "path.");
@@ -345,7 +367,8 @@ __launch_bounds__(Dims::KernelConfig::BLOCK_SIZE, 1) void moe_kernel_topk(
       activations_out, top_k, scoring_func, renormalize, expert_bias,
       routed_scaling_factor, spec, shmem, up_weights_desc, activations_desc,
       down_weights_desc, down_activations_desc, expert_counters, expert_phase,
-      colstripe_counters, colstripe_phase);
+      colstripe_counters, colstripe_phase,
+      expert_base, peer_activations, local_token_start, n_local_tokens);
 }
 
 }  // namespace moe_monokernel

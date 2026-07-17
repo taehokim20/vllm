@@ -173,7 +173,11 @@ __global__ extern void moe_kernel_topk(
     __grid_constant__ CUtensorMap const up_weights_desc,
     __grid_constant__ CUtensorMap const activations_desc,
     __grid_constant__ CUtensorMap const down_weights_desc,
-    __grid_constant__ CUtensorMap const down_activations_desc);
+    __grid_constant__ CUtensorMap const down_activations_desc,
+    // EP dispatch args (inert when peer_activations==nullptr / n_local==0).
+    std::uint32_t expert_base,
+    const A_element* __restrict__ peer_activations,
+    std::uint32_t local_token_start, std::uint32_t n_local_tokens);
 
 }  // namespace moe_monokernel
 

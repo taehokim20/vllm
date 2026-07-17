@@ -57,7 +57,14 @@ void launch_moe_monokernel(
     torch::stable::Tensor& activations_out,
     torch::stable::Tensor& scratchpad, int64_t top_k, int64_t scoring_func,
     bool renormalize, const std::optional<torch::stable::Tensor>& expert_bias,
-    double routed_scaling_factor, const char* diag_name);
+    double routed_scaling_factor, const char* diag_name,
+    // EP dispatch (opt-in). Defaults are inert (no peer buffer / no owned
+    // range) so every existing named-op wrapper that omits them launches the
+    // non-EP path byte-identically, and the kernel receives peer_activations
+    // == nullptr (routing_phase_quantize then skips the peer-read).
+    const std::optional<torch::stable::Tensor>& peer_activations = {},
+    int64_t expert_base = 0, int64_t local_token_start = 0,
+    int64_t n_local_tokens = 0);
 
 /**
  * @brief Macro that expands to a named op wrapper forwarding to
@@ -96,7 +103,10 @@ void launch_moe_monokernel(
             torch::stable::Tensor& scratchpad,
             int64_t top_k, int64_t scoring_func, bool renormalize,
             const std::optional<torch::stable::Tensor>& expert_bias,
-            double routed_scaling_factor, const char* diag_name) {
+            double routed_scaling_factor, const char* diag_name,
+            const std::optional<torch::stable::Tensor>& peer_activations,
+            int64_t expert_base, int64_t local_token_start,
+            int64_t n_local_tokens) {
     // Device residency is guaranteed by the CUDA dispatch key
     // (STABLE_TORCH_LIBRARY_IMPL(..., CUDA, ...)); the stable Tensor API has no
     // is_cuda(), so we only validate the scalar arguments here.
@@ -144,6 +154,22 @@ void launch_moe_monokernel(
     const ScoringFunc sf = static_cast<ScoringFunc>(scoring_func);
     const float routed_scaling_factor_f =
         static_cast<float>(routed_scaling_factor);
+
+    /* EP dispatch args (inert unless a peer buffer is supplied). The kernel
+       reads peer_activations only when non-null (and only the is_ep<Dims>
+       variant acts on expert_base / the owned range), so these are safe for
+       every non-EP shape. */
+    const __nv_bfloat16* peer_activations_ptr = nullptr;
+    if (peer_activations.has_value()) {
+      peer_activations_ptr =
+          reinterpret_cast<const __nv_bfloat16*>(peer_activations->data_ptr());
+    }
+    const std::uint32_t expert_base_u32 =
+        static_cast<std::uint32_t>(expert_base);
+    const std::uint32_t local_token_start_u32 =
+        static_cast<std::uint32_t>(local_token_start);
+    const std::uint32_t n_local_tokens_u32 =
+        static_cast<std::uint32_t>(n_local_tokens);
 
     /* TMA descriptors (see src/moe_tma.h).  Non-TMA variants leave these
        zero-initialized — the kernel parameters are always on the
@@ -198,7 +224,11 @@ void launch_moe_monokernel(
                            (void*)&up_weights_desc,
                            (void*)&activations_desc,
                            (void*)&down_weights_desc,
-                           (void*)&down_activations_desc};
+                           (void*)&down_activations_desc,
+                           (void*)&expert_base_u32,
+                           (void*)&peer_activations_ptr,
+                           (void*)&local_token_start_u32,
+                           (void*)&n_local_tokens_u32};
     const cudaStream_t stream =
         get_current_cuda_stream(activations_in.get_device_index());
     CUDA_CHECK(cudaFuncSetAttribute(

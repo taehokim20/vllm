@@ -136,9 +136,22 @@ template <typename Dims, std::size_t KBlocks, std::size_t Bs, std::size_t KStep,
           std::size_t Fp8KBlocks, std::size_t Fp8NumChunks, std::size_t Fp8Tok,
           std::size_t Fp8KInner, std::size_t ScaleKBlocks, std::size_t ScaleBs>
 __device__ inline void routing_phase_quantize(
-    const A_element (&bf16_in_full)[KBlocks][Bs][KStep],
+    A_element (&bf16_in_full)[KBlocks][Bs][KStep],
     AQ_element (&fp8_act_full)[Fp8KBlocks][Fp8NumChunks][Fp8Tok][Fp8KInner],
-    float (&act_scale)[ScaleKBlocks][ScaleBs], std::uint32_t batch_size) {
+    float (&act_scale)[ScaleKBlocks][ScaleBs], std::uint32_t batch_size,
+    // EP in-kernel dispatch OVERLAP (Stage B): when `peer_activations` is
+    // non-null, tokens OUTSIDE this rank's owned range [own_lo, own_hi) are
+    // REMOTE — their bf16 row is peer-read here (folded into the quantize,
+    // overlapping warp-0 routing) instead of being staged into
+    // `activations_in` by a separate prologue copy + grid_barrier. Each
+    // (token, kblk) pair is owned by exactly one warp, so a `__syncwarp()`
+    // after the per-warp overwrite is sufficient (no cross-warp sync).
+    // Cross-RANK ordering (peer must have staged before we read it) is
+    // provided by the graph-safe ep_wait_ready handshake gated at the kernel
+    // entry (see moe.cu), not here. Defaults (nullptr/0/0) preserve the
+    // original non-EP behavior byte-identically.
+    const A_element* __restrict__ peer_activations = nullptr,
+    std::uint32_t own_lo = 0u, std::uint32_t own_hi = 0u) {
   using CoreDims = MoECoreDims<Dims>;
 
   static_assert(Dims::BS <= 8, "routing_phase_quantize is BS8-only");
@@ -171,6 +184,25 @@ __device__ inline void routing_phase_quantize(
   for (std::uint32_t i = w_idx; i < PAIRS_TOTAL; i += NUM_QUANT_WARPS) {
     const std::uint32_t token = i / K_BLOCKS_TOTAL;
     const std::uint32_t kblk = i % K_BLOCKS_TOTAL;
+
+    // EP dispatch overlap: for REMOTE tokens, peer-read this (token, kblk)
+    // 128-bf16 row directly into bf16_in_full before quantizing it. The
+    // owning warp's 32 lanes cover the 128 elements (4 each); __syncwarp()
+    // orders the overwrite before moe_streaming_quantize_k128 reads the row.
+    // bf16_in_full is dead after quantize (Phase 3 reads only fp8_act_full),
+    // so overwriting it here is safe. peer layout: [BS, HIDDEN] row-major,
+    // HIDDEN = K_BLOCKS_TOTAL * KStep, so row (token, kblk) starts at
+    // token*HIDDEN + kblk*KStep.
+    if (peer_activations != nullptr && (token < own_lo || token >= own_hi)) {
+      const std::uint32_t lane = threadIdx.x & 31u;
+      A_element* dst = &bf16_in_full[kblk][token][0];
+      const A_element* src =
+          peer_activations +
+          static_cast<std::size_t>(token) * (K_BLOCKS_TOTAL * KStep) +
+          static_cast<std::size_t>(kblk) * KStep;
+      for (std::uint32_t e = lane; e < KStep; e += 32u) dst[e] = src[e];
+      __syncwarp();
+    }
 
     const auto& bf_row = bf16_in_full[kblk][token];
     auto& fp8_atom = fp8_act_full[kblk];
