@@ -46,6 +46,7 @@ static_assert(
  * logic exists in exactly one place.  `diag_name` is the label printed by
  * the one-shot `[monokernel]` occupancy diagnostic.
  */
+namespace moe_monokernel {
 template <typename dims>
 void launch_moe_monokernel(
     const torch::stable::Tensor& activations_in,
@@ -65,6 +66,7 @@ void launch_moe_monokernel(
     const std::optional<torch::stable::Tensor>& peer_activations = {},
     int64_t expert_base = 0, int64_t local_token_start = 0,
     int64_t n_local_tokens = 0);
+}  // namespace moe_monokernel
 
 /**
  * @brief Macro that expands to a named op wrapper forwarding to
