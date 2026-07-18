@@ -113,8 +113,9 @@ void launch_moe_monokernel(
     // (STABLE_TORCH_LIBRARY_IMPL(..., CUDA, ...)); the stable Tensor API has no
     // is_cuda(), so we only validate the scalar arguments here.
     STD_TORCH_CHECK(top_k >= 1 && top_k <= 8, "top_k must be between 1 and 8.");
-    STD_TORCH_CHECK(scoring_func == 0 || scoring_func == 1,
-                    "scoring_func must be 0 (sigmoid) or 1 (softmax).");
+    STD_TORCH_CHECK(scoring_func == 0 || scoring_func == 1 || scoring_func == 2,
+                    "scoring_func must be 0 (sigmoid), 1 (softmax), or "
+                    "2 (sqrt-softplus).");
 
     // The kernel takes native CUDA pointer types; reinterpret the stable
     // Tensors' raw data pointers (data_ptr() is const void*, mutable_data_ptr()

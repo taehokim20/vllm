@@ -210,6 +210,14 @@ def paged_attention_v2(
 # Scoring function constants matching the CUDA enum ScoringFunc
 MOE_SCORING_SIGMOID = 0
 MOE_SCORING_SOFTMAX = 1
+MOE_SCORING_SQRT_SOFTPLUS = 2  # sqrt(softplus(logit)) gating (DeepSeek-V4-Flash)
+
+# Accepted scoring-function names -> CUDA ScoringFunc enum value.
+_MOE_SCORING_NAME_TO_INT = {
+    "sigmoid": MOE_SCORING_SIGMOID,
+    "softmax": MOE_SCORING_SOFTMAX,
+    "sqrtsoftplus": MOE_SCORING_SQRT_SOFTPLUS,
+}
 
 
 def _resolve_monokernel_config_id(E: int, N: int, K: int) -> int:
@@ -315,13 +323,12 @@ def moe_monokernel_topk(
     assert expert_scales_down.is_contiguous()
 
     assert 1 <= top_k <= 8, f"top_k must be between 1 and 8, got {top_k}"
-    assert scoring_func in ("softmax", "sigmoid"), (
-        f"scoring_func must be 'softmax' or 'sigmoid', got {scoring_func}"
+    assert scoring_func in _MOE_SCORING_NAME_TO_INT, (
+        f"scoring_func must be one of {sorted(_MOE_SCORING_NAME_TO_INT)}, "
+        f"got {scoring_func}"
     )
 
-    scoring_func_int = (
-        MOE_SCORING_SOFTMAX if scoring_func == "softmax" else MOE_SCORING_SIGMOID
-    )
+    scoring_func_int = _MOE_SCORING_NAME_TO_INT[scoring_func]
 
     E = router_logits.size(1)
     M = activations_in.size(0)
@@ -545,9 +552,11 @@ def moe_monokernel_topk_ep(
     if router_logits.dtype is not torch.bfloat16:
         router_logits = router_logits.to(torch.bfloat16)
 
-    scoring_func_int = (
-        MOE_SCORING_SOFTMAX if scoring_func == "softmax" else MOE_SCORING_SIGMOID
+    assert scoring_func in _MOE_SCORING_NAME_TO_INT, (
+        f"scoring_func must be one of {sorted(_MOE_SCORING_NAME_TO_INT)}, "
+        f"got {scoring_func}"
     )
+    scoring_func_int = _MOE_SCORING_NAME_TO_INT[scoring_func]
 
     E = router_logits.size(1)
     M = activations_in.size(0)

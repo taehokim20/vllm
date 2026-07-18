@@ -155,6 +155,10 @@ struct DimsTunable {
 enum class ScoringFunc : uint32_t {
   SIGMOID = 0,
   SOFTMAX = 1,
+  // sqrt(softplus(logit)) gating (DeepSeek-V4-Flash). Selection is by the raw
+  // logit (softplus and sqrt are both monotone in the logit), and the routing
+  // weight is sqrt(softplus(logit)) renormalized over the top-k * scaling.
+  SQRT_SOFTPLUS = 2,
 };
 
 using W_element = __nv_fp8_e4m3;   // expert weights

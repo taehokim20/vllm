@@ -85,6 +85,18 @@ __device__ static __forceinline__ void warp_softmax_inplace(float* logits) {
  * @param routed_scaling_factor  Scalar folded into the shared weight
  *   normalizer (exact — the routed output is linear in the weights).
  */
+// sqrt(softplus(x)) with the numerical-stability cutoff used by the standalone
+// topk_softplus_sqrt kernel: softplus(x)=log1p(exp(x)) (beta=1), but for
+// x>threshold softplus(x)≈x to avoid exp overflow. Mirrors
+// csrc/libtorch_stable/moe/topk_softplus_sqrt_kernels.cu.
+__device__ __forceinline__ float moe_sqrt_softplus(float x) {
+  constexpr float beta = 1.0f;
+  constexpr float threshold = 20.0f;
+  const float xb = x * beta;
+  const float sp = (xb > threshold) ? x : (__logf(1.0f + __expf(xb)) / beta);
+  return sqrtf(sp);
+}
+
 template <typename Dims>
 __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
                          bool renormalize,
@@ -204,6 +216,26 @@ __device__ void topK_BS8(uint32_t top_k, ScoringFunc scoring_func,
         shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] =
             (uint16_t)topk_experts[k];
         shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = exp_vals[k] * inv;
+      }
+    } else if (scoring_func == ScoringFunc::SQRT_SOFTPLUS) {
+      // sqrt(softplus): weight_k = sqrt(softplus(x_k)), (re)normalized over the
+      // selected set * routed_scaling_factor.  Selection was by the raw logit
+      // (sqrt∘softplus is monotone in it), so topk_scores[k] holds the logit.
+      // Unbiased only (V4-Flash has no correction bias); a biased sqrt-softplus
+      // router would need the bias folded into the SELECTION metric above.
+      float ssp_vals[MoE_SHM<Dims>::MAX_TOPK];
+      float sum_ssp = 0.0f;
+      for (uint32_t k = 0; k < top_k; k++) {
+        ssp_vals[k] = moe_sqrt_softplus(topk_scores[k]);
+        sum_ssp += ssp_vals[k];
+      }
+      float inv =
+          renormalize ? ((sum_ssp > 0.0f) ? (1.0f / sum_ssp) : 1.0f) : 1.0f;
+      inv *= routed_scaling_factor;
+      for (uint32_t k = 0; k < top_k; k++) {
+        shmem->topk_ids_flat[warp_idx * MAX_TOPK + k] =
+            (uint16_t)topk_experts[k];
+        shmem->topk_weights_flat[warp_idx * MAX_TOPK + k] = ssp_vals[k] * inv;
       }
     } else {
       // Sigmoid: weight_k = sigmoid(x_k), optionally renormalized over the
