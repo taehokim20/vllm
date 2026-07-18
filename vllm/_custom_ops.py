@@ -494,6 +494,122 @@ direct_register_custom_op(
 )
 
 
+def moe_monokernel_topk_ep(
+    activations_in: torch.Tensor,
+    router_logits: torch.Tensor,
+    expert_weights_up: torch.Tensor,
+    expert_scales_up: torch.Tensor,
+    expert_weights_down: torch.Tensor,
+    expert_scales_down: torch.Tensor,
+    scratchpad: torch.Tensor,
+    *,
+    peer_activations: torch.Tensor | None,
+    expert_base: int,
+    local_token_start: int,
+    n_local_tokens: int,
+    top_k: int = 1,
+    scoring_func: str = "softmax",
+    renormalize: bool = True,
+    expert_bias: torch.Tensor | None = None,
+    routed_scaling_factor: float = 1.0,
+) -> torch.Tensor:
+    """High-level wrapper for the in-kernel EP dispatch op
+    (``torch.ops._moe_C.moe_monokernel_topk_ep``).
+
+    Mirrors ``moe_monokernel_topk``'s setup — same asserts, up-weight
+    interleave decision (the EP op targets the V4-Flash EP Dims, which mirrors
+    the base default config), and ``activations_out`` allocation — but forwards
+    the four EP args:
+
+      * ``peer_activations``: peer-mapped bf16 [M, K] staging holding the PEER's
+        rows; rows outside ``[local_token_start, +n_local_tokens)`` are
+        peer-read from it inside the kernel. ``None`` => no peer-read (pure
+        local-expert filter, e.g. a single-rank filter test).
+      * ``expert_base``: first GLOBAL expert id this rank owns
+        (``ep_rank * NUM_LOCAL_EXPERTS``).
+      * ``local_token_start`` / ``n_local_tokens``: this rank's owned token
+        range in the gathered tile.
+
+    Returns the per-rank PARTIAL [M, K] over this rank's local experts only;
+    summed across the EP group it equals the full non-EP output.
+    """
+    if not current_platform.is_cuda():
+        raise NotImplementedError(
+            "The optimized moe kernel is only available on CUDA platforms"
+        )
+
+    assert activations_in.is_contiguous()
+    assert expert_weights_up.dtype is torch.float8_e4m3fn
+    assert expert_weights_down.dtype is torch.float8_e4m3fn
+    assert activations_in.dtype is torch.bfloat16
+    if router_logits.dtype is not torch.bfloat16:
+        router_logits = router_logits.to(torch.bfloat16)
+
+    scoring_func_int = (
+        MOE_SCORING_SOFTMAX if scoring_func == "softmax" else MOE_SCORING_SIGMOID
+    )
+
+    E = router_logits.size(1)
+    M = activations_in.size(0)
+    N = expert_weights_up.size(1)  # fused gate+up = 2 * N_half
+    K = expert_weights_up.size(2)
+    assert M <= 8, f"moe_monokernel_topk_ep: unsupported batch size M={M} (<=8)."
+
+    activations_out = torch.zeros_like(activations_in)
+
+    # Up-weight interleave: identical decision to moe_monokernel_topk at the
+    # shipped default config (the EP Dims mirrors it). config_id is always the
+    # default for the EP op (no tunable variant).
+    from vllm.model_executor.layers.fused_moe import monokernel_shapes
+
+    row = monokernel_shapes.row_for(E, N, K)
+    if row is None:
+        raise AssertionError(
+            f"moe_monokernel_topk_ep: unsupported dims E={E}, N={N}, K={K}."
+        )
+    raw_upproj = _monokernel_config_is_raw_upproj(E, N, K, -1)
+    needs_interleave = (not row["all_raw"]) and (not raw_upproj)
+    if needs_interleave:
+        from vllm.model_executor.layers.fused_moe.moe_monokernel_interleave import (
+            interleave_for_tma_wgmma_up_v2,
+        )
+
+        up_weights = getattr(expert_weights_up, "_tma_interleaved_up_v2", None)
+        if up_weights is None:
+            up_weights = interleave_for_tma_wgmma_up_v2(expert_weights_up).contiguous()
+            with contextlib.suppress(AttributeError, RuntimeError):
+                expert_weights_up._tma_interleaved_up_v2 = up_weights
+    else:
+        up_weights = expert_weights_up
+
+    if expert_bias is not None:
+        assert expert_bias.dtype is torch.float32
+        expert_bias = expert_bias.contiguous()
+
+    peer = None if peer_activations is None else peer_activations.contiguous()
+
+    torch.ops._moe_C.moe_monokernel_topk_ep(
+        activations_in,
+        router_logits,
+        up_weights,
+        expert_scales_up,
+        expert_weights_down,
+        expert_scales_down,
+        activations_out,
+        scratchpad,
+        top_k,
+        scoring_func_int,
+        renormalize,
+        expert_bias,
+        float(routed_scaling_factor),
+        peer,
+        int(expert_base),
+        int(local_token_start),
+        int(n_local_tokens),
+    )
+    return activations_out
+
+
 def paged_attention_rocm(
     out: torch.Tensor,
     exp_sum: torch.Tensor,
